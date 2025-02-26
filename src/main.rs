@@ -12,6 +12,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, Duration};
 use once_cell::sync::Lazy;
 use simd_json::prelude::*; // Faster JSON parsing
+use log::{info, warn, error};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -114,7 +115,7 @@ async fn check_balance(client: &Arc<Client>, coin_symbol: &str) -> Option<f64> {
             None
         }
         _ => {
-            eprintln!("❌ Failed to fetch balance");
+            error!("❌ Failed to fetch balance");
             None
         }
     }
@@ -124,12 +125,12 @@ async fn check_balance(client: &Arc<Client>, coin_symbol: &str) -> Option<f64> {
 async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
     // Prevent concurrent order execution attempts
     if ORDER_EXECUTED.load(Ordering::SeqCst) {
-        println!("⚠️ Order already executed, skipping duplicate.");
+        warn!("⚠️ Order already executed, skipping duplicate.");
         return true;
     }
     
     if ORDER_IN_PROGRESS.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-        println!("⚠️ Order execution already in progress, skipping duplicate attempt.");
+        warn!("⚠️ Order execution already in progress, skipping duplicate attempt.");
         return false;
     }
     
@@ -142,7 +143,7 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
     
     if let Some(avail) = balance {
         if avail < amount {
-            println!("⚠️ Insufficient balance: {} available, {} requested", avail, amount);
+            warn!("⚠️ Insufficient balance: {} available, {} requested", avail, amount);
             ORDER_IN_PROGRESS.store(false, Ordering::SeqCst);
             return false;
         }
@@ -166,7 +167,7 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
     let body_str = body.to_string();
     let signature = sign_request(&timestamp, "POST", ORDER_PATH, &body_str);
     
-    println!("⏱ Preparation time: {:?} µs", start_time.elapsed().as_micros());
+    info!("⏱ Preparation time: {:?} µs", start_time.elapsed().as_micros());
     let request_start = Instant::now();
     
     // Execute with minimal timeout for urgency
@@ -182,28 +183,28 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
         .await;
     
     let elapsed = request_start.elapsed();
-    println!("⏱ Sell order request latency: {:?} µs", elapsed.as_micros());
+    info!("⏱ Sell order request latency: {:?} µs", elapsed.as_micros());
     
     match response {
         Ok(resp) => {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            println!("📊 Response Status: {} | {}", status, text);
+            info!("📊 Response Status: {} | {}", status, text);
             
             if status.is_success() {
                 ORDER_EXECUTED.store(true, Ordering::SeqCst);
                 ORDER_IN_PROGRESS.store(false, Ordering::SeqCst);
-                println!("✅ SELL ORDER PLACED FOR {} at {:?}", *FORMATTED_SYMBOL, SystemTime::now());
+                info!("✅ SELL ORDER PLACED FOR {} at {:?}", *FORMATTED_SYMBOL, SystemTime::now());
                 return true;
             } else {
                 ORDER_IN_PROGRESS.store(false, Ordering::SeqCst);
-                println!("❌ API ERROR: {}", text);
+                error!("❌ API ERROR: {}", text);
                 return false;
             }
         }
         Err(e) => {
             ORDER_IN_PROGRESS.store(false, Ordering::SeqCst);
-            println!("❌ REQUEST FAILED: {}", e);
+            error!("❌ REQUEST FAILED: {}", e);
             return false;
         }
     }
@@ -211,17 +212,17 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
 
 /// Optimized WebSocket listener
 async fn listen_websocket(tx: mpsc::Sender<String>) {
-    println!("🔗 Connecting to WebSocket: {}", WS_URL);
+    info!("🔗 Connecting to WebSocket: {}", WS_URL);
     
     loop {
         if ORDER_EXECUTED.load(Ordering::SeqCst) {
-            println!("✅ WebSocket stopped: Order executed successfully.");
+            info!("✅ WebSocket stopped: Order executed successfully.");
             return;
         }
         
         match connect_async(WS_URL).await {
             Ok((ws_stream, _)) => {
-                println!("✅ WebSocket connected!");
+                info!("✅ WebSocket connected!");
                 let (mut write, mut read) = ws_stream.split();
                 
                 // Ping message to keep connection alive
@@ -239,7 +240,7 @@ async fn listen_websocket(tx: mpsc::Sender<String>) {
                 
                 // Send subscribe message
                 if let Err(e) = write.send(Message::Text(subscribe_msg.to_string())).await {
-                    println!("❌ Failed to subscribe: {}. Reconnecting...", e);
+                    error!("❌ Failed to subscribe: {}. Reconnecting...", e);
                     sleep(Duration::from_secs(1)).await;
                     continue;
                 }
@@ -247,18 +248,20 @@ async fn listen_websocket(tx: mpsc::Sender<String>) {
                 // Process incoming messages
                 while let Some(message) = read.next().await {
                     if ORDER_EXECUTED.load(Ordering::SeqCst) {
-                        println!("✅ WebSocket stopped: Order executed successfully.");
+                        info!("✅ WebSocket stopped: Order executed successfully.");
                         return;
                     }
                     
                     match message {
                         Ok(msg) => {
+                            info!("📨 Received WebSocket message: {}", msg); // Log raw message
                             let mut json_data = msg.to_string().into_bytes();
                             if let Ok(parsed) = simd_json::from_slice::<Value>(&mut json_data) {
+                                info!("📦 Parsed JSON: {:?}", parsed); // Log parsed JSON
                                 if parsed.get("action").and_then(Value::as_str) == Some("update") {
                                     if let Some(inst_id) = parsed.get("arg").and_then(|a| a.get("instId")).and_then(Value::as_str) {
                                         if inst_id == TARGET_TOKEN {
-                                            println!("🚨 TARGET TOKEN DETECTED via WebSocket: {}", inst_id);
+                                            info!("🚨 TARGET TOKEN DETECTED via WebSocket: {}", inst_id);
                                             let _ = tx.try_send(inst_id.to_string());
                                         }
                                     }
@@ -266,14 +269,14 @@ async fn listen_websocket(tx: mpsc::Sender<String>) {
                             }
                         }
                         Err(e) => {
-                            println!("WebSocket error: {}. Reconnecting...", e);
+                            error!("WebSocket error: {}. Reconnecting...", e);
                             break;
                         }
                     }
                 }
             }
             Err(e) => {
-                println!("❌ WebSocket connection failed: {}. Retrying in 1s...", e);
+                error!("❌ WebSocket connection failed: {}. Retrying in 1s...", e);
                 sleep(Duration::from_secs(1)).await;
             }
         }
@@ -283,8 +286,9 @@ async fn listen_websocket(tx: mpsc::Sender<String>) {
 /// Main async function
 #[tokio::main]
 async fn main() {
-    println!("🚀 Starting Bitget HFT Bot at {:?}", SystemTime::now());
-    println!("🎯 Targeting token: {}", TARGET_TOKEN);
+    env_logger::init(); // Initialize logger
+    info!("🚀 Starting Bitget HFT Bot at {:?}", SystemTime::now());
+    info!("🎯 Targeting token: {}", TARGET_TOKEN);
     
     // Create optimized HTTP client with connection pooling and DNS caching
     let client = Arc::new(ClientBuilder::new()
@@ -306,18 +310,18 @@ async fn main() {
     // Main loop - process detection events
     while let Some(coin_symbol) = rx.recv().await {
         if ORDER_EXECUTED.load(Ordering::SeqCst) {
-            println!("✅ Order already executed, exiting main loop.");
+            info!("✅ Order already executed, exiting main loop.");
             break;
         }
         
         if execute_sell_order(&client, &coin_symbol).await {
-            println!("🎉 Bot finished: Sell order executed successfully!");
+            info!("🎉 Bot finished: Sell order executed successfully!");
             break;
         } else {
-            println!("🔄 Retrying sell order...");
+            warn!("🔄 Retrying sell order...");
             sleep(Duration::from_millis(100)).await;
         }
     }
     
-    println!("🏁 Bot execution complete");
+    info!("🏁 Bot execution complete");
 }
