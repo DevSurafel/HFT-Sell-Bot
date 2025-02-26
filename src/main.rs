@@ -241,6 +241,18 @@ async fn listen_websocket(tx: mpsc::Sender<String>) {
                     continue;
                 }
                 
+                // Spawn a task to send pings every 30 seconds
+                let mut write_clone = write.clone();
+                tokio::spawn(async move {
+                    loop {
+                        if let Err(e) = write_clone.send(Message::Text(ping_msg.to_string())).await {
+                            println!("❌ Failed to send ping: {}", e);
+                            break;
+                        }
+                        sleep(Duration::from_secs(30)).await;
+                    }
+                });
+                
                 // Process incoming messages
                 while let Some(message) = read.next().await {
                     if ORDER_EXECUTED.load(Ordering::SeqCst) {
