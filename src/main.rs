@@ -9,8 +9,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use tokio::sync::{mpsc, Mutex};
-use tokio::time::{sleep, Duration, interval};
+use tokio::time::{sleep, Duration};
 use once_cell::sync::Lazy;
+use simd_json::prelude::*; // Faster JSON parsing
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -18,8 +19,8 @@ type HmacSha256 = Hmac<Sha256>;
 const API_KEY: &str = "bg_2b02e2a62b65685cee763cc916285ed3";
 const SECRET_KEY: &str = "c347ccb5f4d73d8928f3c3a54258707e3bf2013400c38003fd5192d61dbeccae";
 const PASSPHRASE: &str = "HFTSellNow";
-const TARGET_TOKEN: &str = "BTCUSDT";
-const COIN_AMOUNT: &str = "0.002"; // Adjust based on balance
+const TARGET_TOKEN: &str = "ZOOUSDT";
+const COIN_AMOUNT: &str = "10000"; // Adjust based on balance
 
 // Endpoint constants
 const API_BASE_URL: &str = "https://api.bitget.com";
@@ -72,13 +73,13 @@ async fn check_balance(client: &Arc<Client>, coin_symbol: &str) -> Option<f64> {
         .as_millis()
         .to_string();
     
-    let signature = sign_request(×tamp, "GET", BALANCE_PATH, "");
+    let signature = sign_request(&timestamp, "GET", BALANCE_PATH, "");
 
     let response = client.get(format!("{}{}", API_BASE_URL, BALANCE_PATH))
         .header("Content-Type", "application/json")
         .header("ACCESS-KEY", API_KEY)
         .header("ACCESS-SIGN", &signature)
-        .header("ACCESS-TIMESTAMP", ×tamp)
+        .header("ACCESS-TIMESTAMP", &timestamp)
         .header("ACCESS-PASSPHRASE", PASSPHRASE)
         .timeout(Duration::from_secs(3))
         .send()
@@ -161,7 +162,7 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
     });
     
     let body_str = body.to_string();
-    let signature = sign_request(×tamp, "POST", ORDER_PATH, &body_str);
+    let signature = sign_request(&timestamp, "POST", ORDER_PATH, &body_str);
     
     println!("⏱ Preparation time: {:?}", start_time.elapsed());
     let request_start = Instant::now();
@@ -171,7 +172,7 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
         .header("Content-Type", "application/json")
         .header("ACCESS-KEY", API_KEY)
         .header("ACCESS-SIGN", &signature)
-        .header("ACCESS-TIMESTAMP", ×tamp)
+        .header("ACCESS-TIMESTAMP", &timestamp)
         .header("ACCESS-PASSPHRASE", PASSPHRASE)
         .json(&body)
         .timeout(Duration::from_millis(800))
@@ -241,47 +242,30 @@ async fn listen_websocket(tx: mpsc::Sender<String>) {
                     continue;
                 }
                 
-                // Set up a timer to send pings every 30 seconds
-                let mut ping_interval = interval(Duration::from_secs(30));
-                
-                // Process incoming messages and send pings
-                loop {
-                    tokio::select! {
-                        // Check for incoming messages
-                        Some(message) = read.next() => {
-                            match message {
-                                Ok(msg) => {
-                                    let json_data = msg.to_string();
-                                    if let Ok(parsed) = serde_json::from_str::<Value>(&json_data) {
-                                        if parsed.get("action").and_then(Value::as_str) == Some("update") {
-                                            if let Some(inst_id) = parsed.get("arg").and_then(|a| a.get("instId")).and_then(Value::as_str) {
-                                                if inst_id == TARGET_TOKEN {
-                                                    println!("🚨 TARGET TOKEN DETECTED via WebSocket: {}", inst_id);
-                                                    let _ = tx.try_send(inst_id.to_string());
-                                                }
-                                            }
+                // Process incoming messages
+                while let Some(message) = read.next().await {
+                    if ORDER_EXECUTED.load(Ordering::SeqCst) {
+                        println!("✅ WebSocket stopped: Order executed successfully.");
+                        return;
+                    }
+                    
+                    match message {
+                        Ok(msg) => {
+                            let mut json_data = msg.to_string().into_bytes();
+                            if let Ok(parsed) = simd_json::from_slice::<Value>(&mut json_data) {
+                                if parsed.get("action").and_then(Value::as_str) == Some("update") {
+                                    if let Some(inst_id) = parsed.get("arg").and_then(|a| a.get("instId")).and_then(Value::as_str) {
+                                        if inst_id == TARGET_TOKEN {
+                                            println!("🚨 TARGET TOKEN DETECTED via WebSocket: {}", inst_id);
+                                            let _ = tx.try_send(inst_id.to_string());
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    println!("WebSocket error: {}. Reconnecting...", e);
-                                    break;
-                                }
                             }
                         }
-                        // Send ping when the interval ticks
-                        _ = ping_interval.tick() => {
-                            if let Err(e) = write.send(Message::Text(ping_msg.to_string())).await {
-                                println!("❌ Failed to send ping: {}. Reconnecting...", e);
-                                break;
-                            } else {
-                                println!("📡 Sent ping to keep WebSocket alive");
-                            }
-                        }
-                        // Exit if order is executed
-                        _ = () if ORDER_EXECUTED.load(Ordering::SeqCst) => {
-                            println!("✅ WebSocket stopped: Order executed successfully.");
-                            return;
+                        Err(e) => {
+                            println!("WebSocket error: {}. Reconnecting...", e);
+                            break;
                         }
                     }
                 }
