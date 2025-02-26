@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use tokio::sync::{mpsc, Mutex};
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, Duration, interval};
 use once_cell::sync::Lazy;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -72,13 +72,13 @@ async fn check_balance(client: &Arc<Client>, coin_symbol: &str) -> Option<f64> {
         .as_millis()
         .to_string();
     
-    let signature = sign_request(&timestamp, "GET", BALANCE_PATH, "");
+    let signature = sign_request(×tamp, "GET", BALANCE_PATH, "");
 
     let response = client.get(format!("{}{}", API_BASE_URL, BALANCE_PATH))
         .header("Content-Type", "application/json")
         .header("ACCESS-KEY", API_KEY)
         .header("ACCESS-SIGN", &signature)
-        .header("ACCESS-TIMESTAMP", &timestamp)
+        .header("ACCESS-TIMESTAMP", ×tamp)
         .header("ACCESS-PASSPHRASE", PASSPHRASE)
         .timeout(Duration::from_secs(3))
         .send()
@@ -161,7 +161,7 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
     });
     
     let body_str = body.to_string();
-    let signature = sign_request(&timestamp, "POST", ORDER_PATH, &body_str);
+    let signature = sign_request(×tamp, "POST", ORDER_PATH, &body_str);
     
     println!("⏱ Preparation time: {:?}", start_time.elapsed());
     let request_start = Instant::now();
@@ -171,7 +171,7 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
         .header("Content-Type", "application/json")
         .header("ACCESS-KEY", API_KEY)
         .header("ACCESS-SIGN", &signature)
-        .header("ACCESS-TIMESTAMP", &timestamp)
+        .header("ACCESS-TIMESTAMP", ×tamp)
         .header("ACCESS-PASSPHRASE", PASSPHRASE)
         .json(&body)
         .timeout(Duration::from_millis(800))
@@ -241,42 +241,47 @@ async fn listen_websocket(tx: mpsc::Sender<String>) {
                     continue;
                 }
                 
-                // Spawn a task to send pings every 30 seconds
-                let mut write_clone = write.clone();
-                tokio::spawn(async move {
-                    loop {
-                        if let Err(e) = write_clone.send(Message::Text(ping_msg.to_string())).await {
-                            println!("❌ Failed to send ping: {}", e);
-                            break;
-                        }
-                        sleep(Duration::from_secs(30)).await;
-                    }
-                });
+                // Set up a timer to send pings every 30 seconds
+                let mut ping_interval = interval(Duration::from_secs(30));
                 
-                // Process incoming messages
-                while let Some(message) = read.next().await {
-                    if ORDER_EXECUTED.load(Ordering::SeqCst) {
-                        println!("✅ WebSocket stopped: Order executed successfully.");
-                        return;
-                    }
-                    
-                    match message {
-                        Ok(msg) => {
-                            let json_data = msg.to_string();
-                            if let Ok(parsed) = serde_json::from_str::<Value>(&json_data) {
-                                if parsed.get("action").and_then(Value::as_str) == Some("update") {
-                                    if let Some(inst_id) = parsed.get("arg").and_then(|a| a.get("instId")).and_then(Value::as_str) {
-                                        if inst_id == TARGET_TOKEN {
-                                            println!("🚨 TARGET TOKEN DETECTED via WebSocket: {}", inst_id);
-                                            let _ = tx.try_send(inst_id.to_string());
+                // Process incoming messages and send pings
+                loop {
+                    tokio::select! {
+                        // Check for incoming messages
+                        Some(message) = read.next() => {
+                            match message {
+                                Ok(msg) => {
+                                    let json_data = msg.to_string();
+                                    if let Ok(parsed) = serde_json::from_str::<Value>(&json_data) {
+                                        if parsed.get("action").and_then(Value::as_str) == Some("update") {
+                                            if let Some(inst_id) = parsed.get("arg").and_then(|a| a.get("instId")).and_then(Value::as_str) {
+                                                if inst_id == TARGET_TOKEN {
+                                                    println!("🚨 TARGET TOKEN DETECTED via WebSocket: {}", inst_id);
+                                                    let _ = tx.try_send(inst_id.to_string());
+                                                }
+                                            }
                                         }
                                     }
                                 }
+                                Err(e) => {
+                                    println!("WebSocket error: {}. Reconnecting...", e);
+                                    break;
+                                }
                             }
                         }
-                        Err(e) => {
-                            println!("WebSocket error: {}. Reconnecting...", e);
-                            break;
+                        // Send ping when the interval ticks
+                        _ = ping_interval.tick() => {
+                            if let Err(e) = write.send(Message::Text(ping_msg.to_string())).await {
+                                println!("❌ Failed to send ping: {}. Reconnecting...", e);
+                                break;
+                            } else {
+                                println!("📡 Sent ping to keep WebSocket alive");
+                            }
+                        }
+                        // Exit if order is executed
+                        _ = () if ORDER_EXECUTED.load(Ordering::SeqCst) => {
+                            println!("✅ WebSocket stopped: Order executed successfully.");
+                            return;
                         }
                     }
                 }
