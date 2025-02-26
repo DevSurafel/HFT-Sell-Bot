@@ -54,7 +54,7 @@ async fn execute_sell_order(client: &Arc<Client>) -> bool {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_micros() // Use microseconds for finer granularity
+        .as_millis() // Switched to milliseconds for API compatibility
         .to_string();
     
     // Pre-constructed body for minimum latency
@@ -78,7 +78,7 @@ async fn execute_sell_order(client: &Arc<Client>) -> bool {
         .header("ACCESS-TIMESTAMP", &timestamp)
         .header("ACCESS-PASSPHRASE", PASSPHRASE)
         .json(&body)
-        .timeout(Duration::from_micros(500)) // Reduced to 500 microseconds
+        .timeout(Duration::from_millis(100)) // Adjusted to 100ms - realistic minimum
         .send()
         .await;
     
@@ -132,8 +132,9 @@ async fn main() {
     println!("💰 Sell amount: {}", COIN_AMOUNT);
     
     let client = Arc::new(Client::builder()
-        .pool_max_idle_per_host(10) // Optimize connection pooling
+        .pool_max_idle_per_host(20) // Increased pooling
         .tcp_nodelay(true)          // Reduce TCP latency
+        .http2_prior_knowledge()    // Force HTTP/2
         .build()
         .expect("Failed to create client"));
     
@@ -151,9 +152,8 @@ async fn main() {
             println!("🎉 Sell executed successfully!");
             break;
         } else {
-            println!("🔄 Retrying immediately...");
-            // Minimal delay for CPU efficiency, still sub-millisecond
-            sleep(Duration::from_micros(100)).await;
+            println!("🔄 Retrying after minimal delay...");
+            sleep(Duration::from_millis(10)).await; // 10ms delay to prevent overwhelming API
         }
     }
     
