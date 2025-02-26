@@ -1,6 +1,7 @@
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::protocol::Message;
 use futures_util::{StreamExt, SinkExt};
-use reqwest::{Client, ClientBuilder};
+use reqwest::Client;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use base64::{engine::general_purpose, Engine};
@@ -8,7 +9,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 use once_cell::sync::Lazy;
 
@@ -24,6 +25,8 @@ const COIN_AMOUNT: &str = "10"; // Adjust based on balance
 // Endpoint constants
 const API_BASE_URL: &str = "https://api.bitget.com";
 const WS_URL: &str = "wss://ws.bitget.com/spot/v1/stream";
+const BALANCE_PATH: &str = "/api/spot/v1/account/assets";
+const ORDER_PATH: &str = "/api/spot/v1/trade/orders";
 
 // Pre-compute formatted symbol
 static FORMATTED_SYMBOL: Lazy<String> = Lazy::new(|| format!("{}_SPBL", TARGET_TOKEN));
@@ -200,4 +203,68 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
             return false;
         }
     }
+}
+
+/// Main function
+#[tokio::main]
+async fn main() {
+    println!("🚀 Starting Bitget HFT Bot at {:?}", SystemTime::now());
+    println!("🎯 Targeting token: {}", TARGET_TOKEN);
+    
+    // Create optimized HTTP client with connection pooling and DNS caching
+    let client = Arc::new(Client::new());
+    
+    // Warm up connections before starting
+    warm_up_connections(&client).await;
+    
+    // Pre-authenticate and validate credentials
+    prepare_signature_cache(&client).await;
+    
+    // Channel for communicating token detection with sufficient buffer
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(32);
+    
+    // High priority channel for websocket detections
+    let (priority_tx, mut priority_rx) = tokio::sync::mpsc::channel::<String>(8);
+    
+    // Spawn WebSocket listener
+    let ws_tx = priority_tx.clone();
+    tokio::spawn(async move {
+        listen_websocket(ws_tx).await;
+    });
+    
+    // Spawn polling fallback
+    let client_poll = client.clone();
+    let poll_tx = tx.clone();
+    tokio::spawn(async move {
+        poll_token_status(client_poll, poll_tx).await;
+    });
+    
+    // Spawn priority order processor
+    let priority_client = client.clone();
+    tokio::spawn(async move {
+        while let Some(coin_symbol) = priority_rx.recv().await {
+            if execute_sell_order(&priority_client, &coin_symbol).await {
+                println!("🎉 Bot finished: Sell order executed successfully via priority channel!");
+                return;
+            }
+        }
+    });
+    
+    // Main loop - process regular detection events
+    while let Some(coin_symbol) = rx.recv().await {
+        if ORDER_EXECUTED.load(Ordering::SeqCst) {
+            println!("✅ Order already executed, exiting main loop.");
+            break;
+        }
+        
+        if execute_sell_order(&client, &coin_symbol).await {
+            println!("🎉 Bot finished: Sell order executed successfully!");
+            break;
+        } else {
+            println!("🔄 Retrying sell order...");
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+    
+    println!("🏁 Bot execution complete");
 }
