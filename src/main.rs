@@ -11,7 +11,6 @@ use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, Duration};
 use once_cell::sync::Lazy;
-use simd_json::prelude::*; // Faster JSON parsing
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -251,8 +250,8 @@ async fn listen_websocket(tx: mpsc::Sender<String>) {
                     
                     match message {
                         Ok(msg) => {
-                            let mut json_data = msg.to_string().into_bytes();
-                            if let Ok(parsed) = simd_json::from_slice::<Value>(&mut json_data) {
+                            let json_data = msg.to_string();
+                            if let Ok(parsed) = serde_json::from_str::<Value>(&json_data) {
                                 if parsed.get("action").and_then(Value::as_str) == Some("update") {
                                     if let Some(inst_id) = parsed.get("arg").and_then(|a| a.get("instId")).and_then(Value::as_str) {
                                         if inst_id == TARGET_TOKEN {
