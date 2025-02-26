@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, Duration};
 use once_cell::sync::Lazy;
+use simd_json::serde::from_str; // For faster JSON parsing
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -80,7 +81,7 @@ async fn check_balance(client: &Arc<Client>, coin_symbol: &str) -> Option<f64> {
         .header("ACCESS-SIGN", &signature)
         .header("ACCESS-TIMESTAMP", &timestamp)
         .header("ACCESS-PASSPHRASE", PASSPHRASE)
-        .timeout(Duration::from_millis(500)) // Reduced timeout for faster response
+        .timeout(Duration::from_millis(100)) // Reduced timeout for faster response
         .send()
         .await;
 
@@ -174,7 +175,7 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
         .header("ACCESS-TIMESTAMP", &timestamp)
         .header("ACCESS-PASSPHRASE", PASSPHRASE)
         .json(&body)
-        .timeout(Duration::from_millis(500)) // Reduced timeout for faster response
+        .timeout(Duration::from_millis(100)) // Reduced timeout for faster response
         .send()
         .await;
     
@@ -203,43 +204,6 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
             println!("❌ REQUEST FAILED: {}", e);
             return false;
         }
-    }
-}
-
-/// Polling function optimized for lower CPU usage but still fast response
-async fn poll_token_status(client: Arc<Client>, tx: mpsc::Sender<String>) {
-    let endpoint = format!("{}/api/spot/v1/public/products", API_BASE_URL);
-    let mut backoff = 50; // Start with 50ms polling interval
-    
-    loop {
-        if ORDER_EXECUTED.load(Ordering::SeqCst) {
-            println!("✅ Polling stopped: Order executed successfully.");
-            return;
-        }
-        
-        match client.get(&endpoint).timeout(Duration::from_millis(500)).send().await {
-            Ok(resp) => {
-                if let Ok(json_resp) = resp.json::<Value>().await {
-                    // Reset backoff on successful response
-                    backoff = 50;
-                    
-                    if json_resp["data"].as_array()
-                        .unwrap_or(&vec![])
-                        .iter()
-                        .any(|item| item["symbolName"] == TARGET_TOKEN && item["status"] == "online") {
-                            println!("🚨 Token {} detected via polling!", TARGET_TOKEN);
-                            let _ = tx.try_send(TARGET_TOKEN.to_string());
-                        }
-                }
-            }
-            Err(e) => {
-                println!("Polling error: {}. Retrying with backoff...", e);
-                // Increase backoff on error, cap at 500ms
-                backoff = (backoff * 2).min(500);
-            }
-        }
-        
-        sleep(Duration::from_millis(backoff)).await;
     }
 }
 
@@ -274,42 +238,20 @@ async fn listen_websocket(tx: mpsc::Sender<String>) {
                 // Send subscribe message
                 if let Err(e) = write.send(Message::Text(subscribe_msg.to_string())).await {
                     println!("❌ Failed to subscribe: {}. Reconnecting...", e);
-                    sleep(Duration::from_secs(1)).await;
+                    sleep(Duration::from_millis(100)).await;
                     continue;
                 }
                 
-                // Start ping task
-                let write_clone = write.reunite(read).unwrap();
-                
-                let (mut ws_write, mut ws_read) = write_clone.split();
-                
-                // Spawn a ping task to keep connection alive
-                let ping_task = tokio::spawn(async move {
-                    loop {
-                        if ORDER_EXECUTED.load(Ordering::SeqCst) {
-                            return;
-                        }
-                        
-                        if let Err(e) = ws_write.send(Message::Text(ping_msg.to_string())).await {
-                            println!("❌ Failed to send ping: {}", e);
-                            return;
-                        }
-                        
-                        sleep(Duration::from_secs(15)).await;
-                    }
-                });
-                
                 // Process incoming messages
-                while let Some(message) = ws_read.next().await {
+                while let Some(message) = read.next().await {
                     if ORDER_EXECUTED.load(Ordering::SeqCst) {
-                        ping_task.abort();
                         println!("✅ WebSocket stopped: Order executed successfully.");
                         return;
                     }
                     
                     match message {
                         Ok(msg) => {
-                            if let Ok(json_msg) = serde_json::from_str::<Value>(&msg.to_string()) {
+                            if let Ok(json_msg) = from_str::<Value>(&msg.to_string()) {
                                 if json_msg.get("action").and_then(Value::as_str) == Some("update") {
                                     if let Some(inst_id) = json_msg.get("arg").and_then(|a| a.get("instId")).and_then(Value::as_str) {
                                         if inst_id == TARGET_TOKEN {
@@ -323,65 +265,16 @@ async fn listen_websocket(tx: mpsc::Sender<String>) {
                         }
                         Err(e) => {
                             println!("WebSocket error: {}. Reconnecting...", e);
-                            ping_task.abort();
                             break;
                         }
                     }
                 }
             }
             Err(e) => {
-                println!("❌ WebSocket connection failed: {}. Retrying in 1s...", e);
-                sleep(Duration::from_secs(1)).await;
+                println!("❌ WebSocket connection failed: {}. Retrying in 100ms...", e);
+                sleep(Duration::from_millis(100)).await;
             }
         }
-    }
-}
-
-/// Warm up connection and DNS cache
-async fn warm_up_connections(client: &Arc<Client>) {
-    println!("🔥 Warming up connections and DNS cache...");
-    
-    // Prefetch DNS and establish connection pool
-    let endpoints = [
-        format!("{}/api/spot/v1/public/time", API_BASE_URL),
-        format!("{}{}", API_BASE_URL, BALANCE_PATH),
-        format!("{}{}", API_BASE_URL, ORDER_PATH),
-    ];
-    
-    let mut handles = Vec::new();
-    
-    for endpoint in endpoints {
-        let client_clone = client.clone();
-        let handle = tokio::spawn(async move {
-            let _ = client_clone.get(&endpoint).send().await;
-        });
-        handles.push(handle);
-    }
-    
-    // Wait for all warmup requests to complete
-    for handle in handles {
-        let _ = handle.await;
-    }
-    
-    println!("✅ Connection warmup complete");
-}
-
-/// Pre-calculate signature for faster order execution
-async fn prepare_signature_cache(client: &Arc<Client>) {
-    println!("🔐 Checking authentication and pre-warming API connections...");
-    
-    // Check balance to ensure credentials are valid and warm up connections
-    if let Some(balance) = check_balance(client, TARGET_TOKEN).await {
-        println!("✅ Authentication successful. Available balance: {}", balance);
-        
-        // Pre-populate the balance cache
-        let mut cache = BALANCE_CACHE.lock().await;
-        *cache = Some(BalanceCache {
-            timestamp: Instant::now(),
-            balance,
-        });
-    } else {
-        println!("⚠️ Could not validate authentication. Please check your API credentials.");
     }
 }
 
@@ -399,43 +292,15 @@ async fn main() {
         .build()
         .expect("Failed to build HTTP client"));
     
-    // Warm up connections before starting
-    warm_up_connections(&client).await;
-    
-    // Pre-authenticate and validate credentials
-    prepare_signature_cache(&client).await;
-    
     // Channel for communicating token detection with sufficient buffer
     let (tx, mut rx) = mpsc::channel::<String>(32);
     
-    // High priority channel for websocket detections
-    let (priority_tx, mut priority_rx) = mpsc::channel::<String>(8);
-    
     // Spawn WebSocket listener
-    let ws_tx = priority_tx.clone();
     tokio::spawn(async move {
-        listen_websocket(ws_tx).await;
+        listen_websocket(tx).await;
     });
     
-    // Spawn polling fallback
-    let client_poll = client.clone();
-    let poll_tx = tx.clone();
-    tokio::spawn(async move {
-        poll_token_status(client_poll, poll_tx).await;
-    });
-    
-    // Spawn priority order processor
-    let priority_client = client.clone();
-    tokio::spawn(async move {
-        while let Some(coin_symbol) = priority_rx.recv().await {
-            if execute_sell_order(&priority_client, &coin_symbol).await {
-                println!("🎉 Bot finished: Sell order executed successfully via priority channel!");
-                return;
-            }
-        }
-    });
-    
-    // Main loop - process regular detection events
+    // Main loop - process detection events
     while let Some(coin_symbol) = rx.recv().await {
         if ORDER_EXECUTED.load(Ordering::SeqCst) {
             println!("✅ Order already executed, exiting main loop.");
