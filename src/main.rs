@@ -1,6 +1,3 @@
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::protocol::Message;
-use futures_util::{StreamExt, SinkExt};
 use reqwest::Client;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -54,16 +51,13 @@ fn sign_request(timestamp: &str, method: &str, path: &str, body: &str) -> String
 
 /// Checks account balance for the token with caching
 async fn check_balance(client: &Arc<Client>, coin_symbol: &str) -> Option<f64> {
-    // Check cache first to avoid redundant API calls
-    {
-        let cache = BALANCE_CACHE.lock().await;
-        if let Some(cached) = &*cache {
-            // Use cached balance if less than 1 second old
-            if cached.timestamp.elapsed() < Duration::from_secs(1) {
-                return Some(cached.balance);
-            }
+    let cache = BALANCE_CACHE.lock().await;
+    if let Some(cached) = &*cache {
+        if cached.timestamp.elapsed() < Duration::from_secs(1) {
+            return Some(cached.balance);
         }
     }
+    drop(cache);
     
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -79,7 +73,7 @@ async fn check_balance(client: &Arc<Client>, coin_symbol: &str) -> Option<f64> {
         .header("ACCESS-SIGN", &signature)
         .header("ACCESS-TIMESTAMP", &timestamp)
         .header("ACCESS-PASSPHRASE", PASSPHRASE)
-        .timeout(Duration::from_secs(1)) // Reduce timeout to 1 second
+        .timeout(Duration::from_secs(1))
         .send()
         .await;
 
@@ -97,7 +91,6 @@ async fn check_balance(client: &Arc<Client>, coin_symbol: &str) -> Option<f64> {
                     if asset["coin"].as_str() == Some(coin_prefix) {
                         if let Some(avail_str) = asset["available"].as_str() {
                             if let Ok(balance) = avail_str.parse::<f64>() {
-                                // Update cache
                                 let mut cache = BALANCE_CACHE.lock().await;
                                 *cache = Some(BalanceCache {
                                     timestamp: Instant::now(),
@@ -120,7 +113,6 @@ async fn check_balance(client: &Arc<Client>, coin_symbol: &str) -> Option<f64> {
 
 /// Prepares and executes a sell order with minimal latency
 async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
-    // Prevent concurrent order execution attempts
     if ORDER_EXECUTED.load(Ordering::SeqCst) {
         println!("⚠️ Order already executed, skipping duplicate.");
         return true;
@@ -131,7 +123,6 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
         return false;
     }
     
-    // Attempt to get cached balance or fetch if needed
     let start_time = Instant::now();
     let balance = check_balance(client, coin_symbol).await;
     let amount: f64 = COIN_AMOUNT.parse().unwrap_or(0.0);
@@ -144,7 +135,6 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
         }
     }
     
-    // Prepare order request - precompute as much as possible
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -165,7 +155,6 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
     println!("⏱ Preparation time: {:?}", start_time.elapsed());
     let request_start = Instant::now();
     
-    // Execute with minimal timeout for urgency
     let response = client.post(format!("{}{}", API_BASE_URL, ORDER_PATH))
         .header("Content-Type", "application/json")
         .header("ACCESS-KEY", API_KEY)
@@ -173,7 +162,7 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
         .header("ACCESS-TIMESTAMP", &timestamp)
         .header("ACCESS-PASSPHRASE", PASSPHRASE)
         .json(&body)
-        .timeout(Duration::from_millis(500)) // Reduce timeout to 500ms
+        .timeout(Duration::from_millis(500))
         .send()
         .await;
     
@@ -205,52 +194,50 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
     }
 }
 
-/// Main function
+/// Warm up connections to reduce initial latency
+async fn warm_up_connections(client: &Arc<Client>) {
+    let _ = client.get(API_BASE_URL)
+        .timeout(Duration::from_secs(1))
+        .send()
+        .await;
+    println!("🔥 Connections warmed up");
+}
+
+/// Pre-authenticate and validate credentials
+async fn prepare_signature_cache(client: &Arc<Client>) {
+    let _ = check_balance(client, TARGET_TOKEN).await;
+    println!("🔑 Credentials validated and signature cached");
+}
+
+/// Simple polling fallback mechanism
+async fn poll_token_status(client: Arc<Client>, tx: tokio::sync::mpsc::Sender<String>) {
+    loop {
+        if let Some(balance) = check_balance(&client, TARGET_TOKEN).await {
+            if balance > 0.0 {
+                let _ = tx.send(TARGET_TOKEN.to_string()).await;
+            }
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
 #[tokio::main]
 async fn main() {
     println!("🚀 Starting Bitget HFT Bot at {:?}", SystemTime::now());
     println!("🎯 Targeting token: {}", TARGET_TOKEN);
     
-    // Create optimized HTTP client with connection pooling and DNS caching
     let client = Arc::new(Client::new());
     
-    // Warm up connections before starting
     warm_up_connections(&client).await;
-    
-    // Pre-authenticate and validate credentials
     prepare_signature_cache(&client).await;
     
-    // Channel for communicating token detection with sufficient buffer
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(32);
     
-    // High priority channel for websocket detections
-    let (priority_tx, mut priority_rx) = tokio::sync::mpsc::channel::<String>(8);
-    
-    // Spawn WebSocket listener
-    let ws_tx = priority_tx.clone();
-    tokio::spawn(async move {
-        listen_websocket(ws_tx).await;
-    });
-    
-    // Spawn polling fallback
     let client_poll = client.clone();
-    let poll_tx = tx.clone();
     tokio::spawn(async move {
-        poll_token_status(client_poll, poll_tx).await;
+        poll_token_status(client_poll, tx).await;
     });
     
-    // Spawn priority order processor
-    let priority_client = client.clone();
-    tokio::spawn(async move {
-        while let Some(coin_symbol) = priority_rx.recv().await {
-            if execute_sell_order(&priority_client, &coin_symbol).await {
-                println!("🎉 Bot finished: Sell order executed successfully via priority channel!");
-                return;
-            }
-        }
-    });
-    
-    // Main loop - process regular detection events
     while let Some(coin_symbol) = rx.recv().await {
         if ORDER_EXECUTED.load(Ordering::SeqCst) {
             println!("✅ Order already executed, exiting main loop.");
