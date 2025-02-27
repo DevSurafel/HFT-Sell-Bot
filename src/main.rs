@@ -113,18 +113,21 @@ async fn listen_websocket(tx: mpsc::Sender<String>, ws_sender: mpsc::Sender<Mess
                             if let Ok(json_msg) = serde_json::from_str::<Value>(&msg.to_string()) {
                                 println!("📊 Parsed JSON message: {:?}", json_msg); // Log parsed JSON
 
-                                if json_msg.get("action").and_then(Value::as_str) == Some("update") {
-                                    if let Some(inst_id) = json_msg.get("arg").and_then(|a| a.get("instId")).and_then(Value::as_str) {
-                                        if inst_id == TARGET_TOKEN {
-                                            println!("🚨 TARGET TOKEN DETECTED via WebSocket: {}", inst_id);
+                                // Check if the message is a snapshot or update for the target token
+                                if let Some(action) = json_msg.get("action").and_then(Value::as_str) {
+                                    if action == "snapshot" || action == "update" {
+                                        if let Some(inst_id) = json_msg.get("arg").and_then(|a| a.get("instId")).and_then(Value::as_str) {
+                                            if inst_id == TARGET_TOKEN {
+                                                println!("🚨 TARGET TOKEN DETECTED via WebSocket: {}", inst_id);
 
-                                            // Execute order immediately
-                                            if !ORDER_EXECUTED.load(Ordering::Relaxed) {
-                                                let _ = execute_sell_order(&ws_sender).await;
+                                                // Execute order immediately
+                                                if !ORDER_EXECUTED.load(Ordering::Relaxed) {
+                                                    let _ = execute_sell_order(&ws_sender).await;
+                                                }
+
+                                                // Notify through channel as backup
+                                                let _ = tx.try_send(inst_id.to_string());
                                             }
-
-                                            // Notify through channel as backup
-                                            let _ = tx.try_send(inst_id.to_string());
                                         }
                                     }
                                 }
