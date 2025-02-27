@@ -5,7 +5,7 @@ use sha2::Sha256;
 use base64::{engine::general_purpose, Engine};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 use once_cell::sync::Lazy;
@@ -14,8 +14,8 @@ type HmacSha256 = Hmac<Sha256>;
 
 // API Credentials
 const SECRET_KEY: &str = "c347ccb5f4d73d8928f3c3a54258707e3bf2013400c38003fd5192d61dbeccae";
-const TARGET_TOKEN: &str = "ZOOUSDT";
-const COIN_AMOUNT: &str = "10000"; // Adjust based on balance
+const TARGET_TOKEN: &str = "BTCUSDT";
+const COIN_AMOUNT: &str = "0.002"; // Adjust based on balance
 
 // WebSocket URL
 const WS_URL: &str = "wss://ws.bitget.com/spot/v1/stream";
@@ -41,6 +41,7 @@ async fn execute_sell_order(ws_sender: &mpsc::Sender<Message>) -> bool {
         return true;
     }
 
+    let start_time = Instant::now();
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -66,7 +67,7 @@ async fn execute_sell_order(ws_sender: &mpsc::Sender<Message>) -> bool {
     }
 
     ORDER_EXECUTED.store(true, Ordering::Release);
-    println!("✅ SELL ORDER PLACED FOR {} at {:?}", *FORMATTED_SYMBOL, SystemTime::now());
+    println!("✅ SELL ORDER PLACED FOR {} at {:?} (latency: {:?})", *FORMATTED_SYMBOL, SystemTime::now(), start_time.elapsed());
     true
 }
 
