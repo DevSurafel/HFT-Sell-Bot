@@ -14,7 +14,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 // API Credentials
 const SECRET_KEY: &str = "c347ccb5f4d73d8928f3c3a54258707e3bf2013400c38003fd5192d61dbeccae";
-const TARGET_TOKEN: &str = "PAWSUSDT"; // Replace with your new token, e.g., "NEWTOKENUSDT"
+const TARGET_TOKEN: &str = "PAWSUSDT"; // Replace with your new token
 const COIN_AMOUNT: &str = "20"; // Adjust based on your balance
 const WS_URL: &str = "wss://ws.bitget.com/spot/v1/stream";
 
@@ -22,7 +22,7 @@ const WS_URL: &str = "wss://ws.bitget.com/spot/v1/stream";
 static FORMATTED_SYMBOL: Lazy<String> = Lazy::new(|| format!("{}_SPBL", TARGET_TOKEN));
 
 // Atomic flag to track if the order has been executed
-static ORDER_EXECUTED: AtomicBool = AtomicBool::new(false); // Fixed: Removed duplicate "AtomicBool ="
+static ORDER_EXECUTED: AtomicBool = AtomicBool::new(false);
 
 #[inline(always)]
 fn sign_request(timestamp: &str, method: &str, path: &str, body: &str) -> String {
@@ -50,7 +50,7 @@ async fn execute_sell_order(ws_sender: &mpsc::Sender<Message>) -> bool {
             "quantity": COIN_AMOUNT,
             "force": "gtc",
             "timestamp": timestamp,
-            "signature": sign_request(&timestamp, "POST", "/api/spot/v1/trade/orders", "") // Fixed: Corrected `×tamp` to `&timestamp`
+            "signature": sign_request(&timestamp, "POST", "/api/spot/v1/trade/orders", "") // Fixed: Changed `×tamp` to `timestamp`
         }]
     });
 
@@ -87,8 +87,8 @@ async fn check_and_execute(ws_sender: mpsc::Sender<Message>) {
                 });
 
                 if let Err(e) = write.send(Message::Text(subscribe_msg.to_string())).await {
-                    println!("❌ Failed to subscribe: {}. Reconnecting...", e);
-                    sleep(Duration::from_secs(1)).await;
+                    println!("❌ Failed to subscribe: {}. Reconnecting in 100µs...", e);
+                    sleep(Duration::from_micros(100)).await; // Reduced from 1s to 100µs
                     continue;
                 }
 
@@ -111,15 +111,15 @@ async fn check_and_execute(ws_sender: mpsc::Sender<Message>) {
                             }
                         }
                         Err(e) => {
-                            println!("❌ WebSocket error: {}. Reconnecting...", e);
+                            println!("❌ WebSocket error: {}. Reconnecting in 100µs...", e);
                             break;
                         }
                     }
                 }
             }
             Err(e) => {
-                println!("❌ WebSocket connection failed: {}. Retrying...", e);
-                sleep(Duration::from_secs(1)).await;
+                println!("❌ WebSocket connection failed: {}. Retrying in 100µs...", e);
+                sleep(Duration::from_micros(100)).await; // Reduced from 1s to 100µs
             }
         }
     }
