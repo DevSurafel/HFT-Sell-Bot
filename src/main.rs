@@ -11,33 +11,27 @@ use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, Duration};
 use once_cell::sync::Lazy;
-use simd_json::serde::from_str; // For faster JSON parsing
+use simd_json::serde::from_str;
 
 type HmacSha256 = Hmac<Sha256>;
 
-// API Credentials
 const API_KEY: &str = "bg_2b02e2a62b65685cee763cc916285ed3";
 const SECRET_KEY: &str = "c347ccb5f4d73d8928f3c3a54258707e3bf2013400c38003fd5192d61dbeccae";
 const PASSPHRASE: &str = "HFTSellNow";
 const TARGET_TOKEN: &str = "BTCUSDT";
-const COIN_AMOUNT: &str = "0.002"; // Adjust based on balance
+const COIN_AMOUNT: &str = "0.002";
 
-// Endpoint constants
 const API_BASE_URL: &str = "https://api.bitget.com";
 const WS_URL: &str = "wss://ws.bitget.com/spot/v1/stream";
 
-// Pre-compute formatted symbol
 static FORMATTED_SYMBOL: Lazy<String> = Lazy::new(|| format!("{}_SPBL", TARGET_TOKEN));
 
-// Improved atomic flags for better state management
 static ORDER_EXECUTED: AtomicBool = AtomicBool::new(false);
 static ORDER_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
-// Pre-computed API paths
 const BALANCE_PATH: &str = "/api/spot/v1/account/assets";
 const ORDER_PATH: &str = "/api/spot/v1/trade/orders";
 
-// Cache the balance check to avoid redundant API calls
 struct BalanceCache {
     timestamp: Instant,
     balance: f64,
@@ -45,7 +39,6 @@ struct BalanceCache {
 
 static BALANCE_CACHE: Lazy<Mutex<Option<BalanceCache>>> = Lazy::new(|| Mutex::new(None));
 
-/// Generates an HMAC-SHA256 signature
 #[inline]
 fn sign_request(timestamp: &str, method: &str, path: &str, body: &str) -> String {
     let message = format!("{}{}{}{}", timestamp, method, path, body);
@@ -54,13 +47,10 @@ fn sign_request(timestamp: &str, method: &str, path: &str, body: &str) -> String
     general_purpose::STANDARD.encode(mac.finalize().into_bytes())
 }
 
-/// Checks account balance for the token with caching
 async fn check_balance(client: &Arc<Client>, coin_symbol: &str) -> Option<f64> {
-    // Check cache first to avoid redundant API calls
     {
         let cache = BALANCE_CACHE.lock().await;
         if let Some(cached) = &*cache {
-            // Use cached balance if less than 5 seconds old
             if cached.timestamp.elapsed() < Duration::from_secs(5) {
                 return Some(cached.balance);
             }
@@ -81,7 +71,7 @@ async fn check_balance(client: &Arc<Client>, coin_symbol: &str) -> Option<f64> {
         .header("ACCESS-SIGN", &signature)
         .header("ACCESS-TIMESTAMP", &timestamp)
         .header("ACCESS-PASSPHRASE", PASSPHRASE)
-        .timeout(Duration::from_millis(100)) // Reduced timeout for faster response
+        .timeout(Duration::from_millis(100))
         .send()
         .await;
 
@@ -99,7 +89,6 @@ async fn check_balance(client: &Arc<Client>, coin_symbol: &str) -> Option<f64> {
                     if asset["coin"].as_str() == Some(coin_prefix) {
                         if let Some(avail_str) = asset["available"].as_str() {
                             if let Ok(balance) = avail_str.parse::<f64>() {
-                                // Update cache
                                 let mut cache = BALANCE_CACHE.lock().await;
                                 *cache = Some(BalanceCache {
                                     timestamp: Instant::now(),
@@ -120,9 +109,7 @@ async fn check_balance(client: &Arc<Client>, coin_symbol: &str) -> Option<f64> {
     }
 }
 
-/// Prepares and executes a sell order with minimal latency
 async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
-    // Prevent concurrent order execution attempts
     if ORDER_EXECUTED.load(Ordering::SeqCst) {
         println!("⚠️ Order already executed, skipping duplicate.");
         return true;
@@ -133,7 +120,6 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
         return false;
     }
     
-    // Attempt to get cached balance or fetch if needed
     let start_time = Instant::now();
     let balance = check_balance(client, coin_symbol).await;
     let amount: f64 = COIN_AMOUNT.parse().unwrap_or(0.0);
@@ -146,7 +132,6 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
         }
     }
     
-    // Prepare order request - precompute as much as possible
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -167,7 +152,6 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
     println!("⏱ Preparation time: {:?}", start_time.elapsed());
     let request_start = Instant::now();
     
-    // Execute with minimal timeout for urgency
     let response = client.post(format!("{}{}", API_BASE_URL, ORDER_PATH))
         .header("Content-Type", "application/json")
         .header("ACCESS-KEY", API_KEY)
@@ -175,7 +159,7 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
         .header("ACCESS-TIMESTAMP", &timestamp)
         .header("ACCESS-PASSPHRASE", PASSPHRASE)
         .json(&body)
-        .timeout(Duration::from_millis(100)) // Reduced timeout for faster response
+        .timeout(Duration::from_millis(100))
         .send()
         .await;
     
@@ -192,22 +176,21 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
                 ORDER_EXECUTED.store(true, Ordering::SeqCst);
                 ORDER_IN_PROGRESS.store(false, Ordering::SeqCst);
                 println!("✅ SELL ORDER PLACED FOR {} at {:?}", *FORMATTED_SYMBOL, SystemTime::now());
-                return true;
+                true
             } else {
                 ORDER_IN_PROGRESS.store(false, Ordering::SeqCst);
                 println!("❌ API ERROR: {}", text);
-                return false;
+                false
             }
         }
         Err(e) => {
             ORDER_IN_PROGRESS.store(false, Ordering::SeqCst);
             println!("❌ REQUEST FAILED: {}", e);
-            return false;
+            false
         }
     }
 }
 
-/// Optimized WebSocket listener
 async fn listen_websocket(tx: mpsc::Sender<String>) {
     println!("🔗 Connecting to WebSocket: {}", WS_URL);
     
@@ -222,10 +205,7 @@ async fn listen_websocket(tx: mpsc::Sender<String>) {
                 println!("✅ WebSocket connected!");
                 let (mut write, mut read) = ws_stream.split();
                 
-                // Ping message to keep connection alive
                 let ping_msg = json!({"op": "ping"});
-                
-                // Subscribe message
                 let subscribe_msg = json!({
                     "op": "subscribe",
                     "args": [{
@@ -235,14 +215,12 @@ async fn listen_websocket(tx: mpsc::Sender<String>) {
                     }]
                 });
                 
-                // Send subscribe message
                 if let Err(e) = write.send(Message::Text(subscribe_msg.to_string())).await {
                     println!("❌ Failed to subscribe: {}. Reconnecting...", e);
                     sleep(Duration::from_millis(100)).await;
                     continue;
                 }
                 
-                // Process incoming messages
                 while let Some(message) = read.next().await {
                     if ORDER_EXECUTED.load(Ordering::SeqCst) {
                         println!("✅ WebSocket stopped: Order executed successfully.");
@@ -250,19 +228,20 @@ async fn listen_websocket(tx: mpsc::Sender<String>) {
                     }
                     
                     match message {
-                        Ok(msg) => {
-                            if let Ok(json_msg) = from_str::<Value>(&msg.to_string()) {
+                        Ok(Message::Text(text)) => {
+                            let mut text_mut = text;
+                            if let Ok(json_msg) = from_str::<Value>(&mut text_mut) {
                                 if json_msg.get("action").and_then(Value::as_str) == Some("update") {
                                     if let Some(inst_id) = json_msg.get("arg").and_then(|a| a.get("instId")).and_then(Value::as_str) {
                                         if inst_id == TARGET_TOKEN {
                                             println!("🚨 TARGET TOKEN DETECTED via WebSocket: {}", inst_id);
-                                            // Use try_send to avoid blocking
                                             let _ = tx.try_send(inst_id.to_string());
                                         }
                                     }
                                 }
                             }
                         }
+                        Ok(_) => {}
                         Err(e) => {
                             println!("WebSocket error: {}. Reconnecting...", e);
                             break;
@@ -278,13 +257,11 @@ async fn listen_websocket(tx: mpsc::Sender<String>) {
     }
 }
 
-/// Main async function
 #[tokio::main]
 async fn main() {
     println!("🚀 Starting Bitget HFT Bot at {:?}", SystemTime::now());
     println!("🎯 Targeting token: {}", TARGET_TOKEN);
     
-    // Create optimized HTTP client with connection pooling and DNS caching
     let client = Arc::new(ClientBuilder::new()
         .tcp_keepalive(Some(Duration::from_secs(60)))
         .timeout(Duration::from_secs(10))
@@ -292,15 +269,12 @@ async fn main() {
         .build()
         .expect("Failed to build HTTP client"));
     
-    // Channel for communicating token detection with sufficient buffer
     let (tx, mut rx) = mpsc::channel::<String>(32);
     
-    // Spawn WebSocket listener
     tokio::spawn(async move {
         listen_websocket(tx).await;
     });
     
-    // Main loop - process detection events
     while let Some(coin_symbol) = rx.recv().await {
         if ORDER_EXECUTED.load(Ordering::SeqCst) {
             println!("✅ Order already executed, exiting main loop.");
