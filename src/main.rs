@@ -4,9 +4,8 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use base64::{engine::general_purpose, Engine};
 use serde_json::{json, Value};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 use once_cell::sync::Lazy;
@@ -171,7 +170,7 @@ async fn main() {
     });
 
     // Wait for token detection and execute order
-    while let Some(coin_symbol) = rx.recv().await {
+    while let Some(_coin_symbol) = rx.recv().await {
         if ORDER_EXECUTED.load(Ordering::Relaxed) {
             println!("✅ Order already executed, exiting execution loop.");
             break;
