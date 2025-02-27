@@ -251,7 +251,8 @@ async fn listen_websocket(tx: mpsc::Sender<String>) {
                     
                     match message {
                         Ok(msg) => {
-                            if let Ok(json_msg) = from_str::<Value>(&msg.to_string()) {
+                            let mut msg_str = msg.to_string();
+                            if let Ok(json_msg) = from_str::<Value>(&mut msg_str) {
                                 if json_msg.get("action").and_then(Value::as_str) == Some("update") {
                                     if let Some(inst_id) = json_msg.get("arg").and_then(|a| a.get("instId")).and_then(Value::as_str) {
                                         if inst_id == TARGET_TOKEN {
