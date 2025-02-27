@@ -14,7 +14,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 // API Credentials
 const SECRET_KEY: &str = "c347ccb5f4d73d8928f3c3a54258707e3bf2013400c38003fd5192d61dbeccae";
-const TARGET_TOKEN: &str = "BTCUSDT";
+const TARGET_TOKEN: &str = "ZOOLUSDT";
 const COIN_AMOUNT: &str = "0.002"; // Adjust based on balance
 
 // WebSocket URL
