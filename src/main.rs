@@ -108,7 +108,11 @@ async fn listen_websocket(tx: mpsc::Sender<String>, ws_sender: mpsc::Sender<Mess
 
                     match message {
                         Ok(msg) => {
+                            println!("📩 Received WebSocket message: {}", msg); // Log all incoming messages
+
                             if let Ok(json_msg) = serde_json::from_str::<Value>(&msg.to_string()) {
+                                println!("📊 Parsed JSON message: {:?}", json_msg); // Log parsed JSON
+
                                 if json_msg.get("action").and_then(Value::as_str) == Some("update") {
                                     if let Some(inst_id) = json_msg.get("arg").and_then(|a| a.get("instId")).and_then(Value::as_str) {
                                         if inst_id == TARGET_TOKEN {
