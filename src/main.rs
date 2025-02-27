@@ -22,7 +22,7 @@ const WS_URL: &str = "wss://ws.bitget.com/spot/v1/stream";
 static FORMATTED_SYMBOL: Lazy<String> = Lazy::new(|| format!("{}_SPBL", TARGET_TOKEN));
 
 // Atomic flag to track if the order has been executed
-static ORDER_EXECUTED: AtomicBool = AtomicBool = AtomicBool::new(false);
+static ORDER_EXECUTED: AtomicBool = AtomicBool::new(false); // Fixed: Removed duplicate "AtomicBool ="
 
 #[inline(always)]
 fn sign_request(timestamp: &str, method: &str, path: &str, body: &str) -> String {
@@ -50,7 +50,7 @@ async fn execute_sell_order(ws_sender: &mpsc::Sender<Message>) -> bool {
             "quantity": COIN_AMOUNT,
             "force": "gtc",
             "timestamp": timestamp,
-            "signature": sign_request(&timestamp, "POST", "/api/spot/v1/trade/orders", "")
+            "signature": sign_request(&timestamp, "POST", "/api/spot/v1/trade/orders", "") // Fixed: Corrected `×tamp` to `&timestamp`
         }]
     });
 
