@@ -20,8 +20,8 @@ type HmacSha256 = Hmac<Sha256>;
 const API_KEY: &str = "bg_2b02e2a62b65685cee763cc916285ed3";
 const SECRET_KEY: &str = "c347ccb5f4d73d8928f3c3a54258707e3bf2013400c38003fd5192d61dbeccae";
 const PASSPHRASE: &str = "HFTSellNow";
-const TARGET_TOKEN: &str = "BTCUSDT";
-const COIN_AMOUNT: &str = "10"; // Adjust based on balance
+const TARGET_TOKEN: &str = "ZOOUSDT";
+const COIN_AMOUNT: &str = "10000"; // Adjust based on balance
 
 // Endpoint constants
 const API_BASE_URL: &str = "https://api.bitget.com";
@@ -169,7 +169,7 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_micros()
+        .as_millis() // Ensure timestamp is in milliseconds
         .to_string();
     
     // Use cached template for order JSON to avoid serialization cost
@@ -430,7 +430,7 @@ async fn prepare_for_execution(client: &Arc<Client>) {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_micros()
+        .as_millis() // Ensure timestamp is in milliseconds
         .to_string();
     
     let _signature = sign_request(&timestamp, "POST", ORDER_PATH, &ORDER_TEMPLATE);
