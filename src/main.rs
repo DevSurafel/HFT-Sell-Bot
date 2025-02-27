@@ -223,7 +223,7 @@ async fn listen_websocket(tx: mpsc::Sender<String>) {
                 let (mut write, mut read) = ws_stream.split();
                 
                 // Ping message to keep connection alive
-                let _ping_msg = json!({"op": "ping"});
+                let ping_msg = json!({"op": "ping"});
                 
                 // Subscribe message
                 let subscribe_msg = json!({
@@ -236,7 +236,6 @@ async fn listen_websocket(tx: mpsc::Sender<String>) {
                 });
                 
                 // Send subscribe message
-                println!("📤 Sending subscription message: {}", subscribe_msg);
                 if let Err(e) = write.send(Message::Text(subscribe_msg.to_string())).await {
                     println!("❌ Failed to subscribe: {}. Reconnecting...", e);
                     sleep(Duration::from_millis(100)).await;
@@ -252,19 +251,13 @@ async fn listen_websocket(tx: mpsc::Sender<String>) {
                     
                     match message {
                         Ok(msg) => {
-                            println!("📥 Received WebSocket message: {:?}", msg);
-                            let mut msg_str = msg.to_string();
-                            // Use unsafe block to call simd_json::from_str
-                            unsafe {
-                                if let Ok(json_msg) = from_str::<Value>(&mut msg_str) {
-                                    println!("📄 Parsed JSON message: {:?}", json_msg);
-                                    if json_msg.get("action").and_then(Value::as_str) == Some("update") {
-                                        if let Some(inst_id) = json_msg.get("arg").and_then(|a| a.get("instId")).and_then(Value::as_str) {
-                                            if inst_id == TARGET_TOKEN {
-                                                println!("🚨 TARGET TOKEN DETECTED via WebSocket: {}", inst_id);
-                                                // Use try_send to avoid blocking
-                                                let _ = tx.try_send(inst_id.to_string());
-                                            }
+                            if let Ok(json_msg) = from_str::<Value>(&msg.to_string()) {
+                                if json_msg.get("action").and_then(Value::as_str) == Some("update") {
+                                    if let Some(inst_id) = json_msg.get("arg").and_then(|a| a.get("instId")).and_then(Value::as_str) {
+                                        if inst_id == TARGET_TOKEN {
+                                            println!("🚨 TARGET TOKEN DETECTED via WebSocket: {}", inst_id);
+                                            // Use try_send to avoid blocking
+                                            let _ = tx.try_send(inst_id.to_string());
                                         }
                                     }
                                 }
