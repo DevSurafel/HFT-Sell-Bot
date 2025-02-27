@@ -12,10 +12,12 @@ use once_cell::sync::Lazy;
 
 type HmacSha256 = Hmac<Sha256>;
 
-// API Credentials
+// API Credentials (DO NOT HARDCODE IN PRODUCTION - USE ENVIRONMENT VARIABLES OR SECURE VAULTS)
+const API_KEY: &str = "bg_2b02e2a62b65685cee763cc916285ed3";
 const SECRET_KEY: &str = "c347ccb5f4d73d8928f3c3a54258707e3bf2013400c38003fd5192d61dbeccae";
-const TARGET_TOKEN: &str = "ZOOUSDT"; // Replace with your new token
-const COIN_AMOUNT: &str = "10000"; // Adjust based on your balance
+const PASSPHRASE: &str = "HFTSellNow";
+const TARGET_TOKEN: &str = "BTCUSDT";
+const COIN_AMOUNT: &str = "0.002"; // Adjust based on balance
 const WS_URL: &str = "wss://ws.bitget.com/spot/v1/stream";
 
 // Pre-compute formatted symbol
@@ -41,6 +43,9 @@ async fn execute_sell_order(ws_sender: &mpsc::Sender<Message>) -> bool {
     let start_time = Instant::now();
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis().to_string();
 
+    // Sign the request
+    let signature = sign_request(&timestamp, "POST", "/api/spot/v1/trade/orders", "");
+
     let order_msg = json!({
         "op": "order",
         "args": [{
@@ -50,7 +55,9 @@ async fn execute_sell_order(ws_sender: &mpsc::Sender<Message>) -> bool {
             "quantity": COIN_AMOUNT,
             "force": "gtc",
             "timestamp": timestamp,
-            "signature": sign_request(&timestamp, "POST", "/api/spot/v1/trade/orders", "") // Fixed: Changed `×tamp` to `timestamp`
+            "signature": signature,
+            "api_key": API_KEY,
+            "passphrase": PASSPHRASE
         }]
     });
 
@@ -77,6 +84,7 @@ async fn check_and_execute(ws_sender: mpsc::Sender<Message>) {
                 println!("✅ WebSocket connected!");
                 let (mut write, mut read) = ws_stream.split();
 
+                // Subscribe to the target token's ticker channel
                 let subscribe_msg = json!({
                     "op": "subscribe",
                     "args": [{
@@ -92,6 +100,7 @@ async fn check_and_execute(ws_sender: mpsc::Sender<Message>) {
                     continue;
                 }
 
+                // Listen for WebSocket messages
                 while let Some(message) = read.next().await {
                     if ORDER_EXECUTED.load(Ordering::Relaxed) {
                         return;
