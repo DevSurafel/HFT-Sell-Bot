@@ -14,19 +14,16 @@ type HmacSha256 = Hmac<Sha256>;
 
 // API Credentials
 const SECRET_KEY: &str = "c347ccb5f4d73d8928f3c3a54258707e3bf2013400c38003fd5192d61dbeccae";
-const TARGET_TOKEN: &str = "ZOOUSDT";
-const COIN_AMOUNT: &str = "20"; // Adjust based on balance
-
-// WebSocket URL
+const TARGET_TOKEN: &str = "ZOOUSDT"; // Replace with your new token, e.g., "NEWTOKENUSDT"
+const COIN_AMOUNT: &str = "20"; // Adjust based on your balance
 const WS_URL: &str = "wss://ws.bitget.com/spot/v1/stream";
 
 // Pre-compute formatted symbol
 static FORMATTED_SYMBOL: Lazy<String> = Lazy::new(|| format!("{}_SPBL", TARGET_TOKEN));
 
 // Atomic flag to track if the order has been executed
-static ORDER_EXECUTED: AtomicBool = AtomicBool::new(false);
+static ORDER_EXECUTED: AtomicBool = AtomicBool = AtomicBool::new(false);
 
-/// Generates an HMAC-SHA256 signature with minimal overhead
 #[inline(always)]
 fn sign_request(timestamp: &str, method: &str, path: &str, body: &str) -> String {
     let message = format!("{}{}{}{}", timestamp, method, path, body);
@@ -35,18 +32,14 @@ fn sign_request(timestamp: &str, method: &str, path: &str, body: &str) -> String
     general_purpose::STANDARD.encode(mac.finalize().into_bytes())
 }
 
-/// Prepares and executes a sell order via WebSocket
 async fn execute_sell_order(ws_sender: &mpsc::Sender<Message>) -> bool {
     if ORDER_EXECUTED.load(Ordering::Relaxed) {
+        println!("ℹ️ Order already executed, skipping...");
         return true;
     }
 
     let start_time = Instant::now();
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis()
-        .to_string();
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis().to_string();
 
     let order_msg = json!({
         "op": "order",
@@ -62,17 +55,16 @@ async fn execute_sell_order(ws_sender: &mpsc::Sender<Message>) -> bool {
     });
 
     if let Err(e) = ws_sender.send(Message::Text(order_msg.to_string())).await {
-        println!("❌ Failed to send order via WebSocket: {}", e);
+        println!("❌ Failed to send order: {}", e);
         return false;
     }
 
     ORDER_EXECUTED.store(true, Ordering::Release);
-    println!("✅ SELL ORDER PLACED FOR {} at {:?} (latency: {:?})", *FORMATTED_SYMBOL, SystemTime::now(), start_time.elapsed());
+    println!("✅ SELL ORDER PLACED FOR {} (latency: {:?})", *FORMATTED_SYMBOL, start_time.elapsed());
     true
 }
 
-/// WebSocket listener for market data and order execution
-async fn listen_websocket(tx: mpsc::Sender<String>, ws_sender: mpsc::Sender<Message>) {
+async fn check_and_execute(ws_sender: mpsc::Sender<Message>) {
     println!("🔗 Connecting to WebSocket: {}", WS_URL);
 
     loop {
@@ -85,7 +77,6 @@ async fn listen_websocket(tx: mpsc::Sender<String>, ws_sender: mpsc::Sender<Mess
                 println!("✅ WebSocket connected!");
                 let (mut write, mut read) = ws_stream.split();
 
-                // Subscribe to market data
                 let subscribe_msg = json!({
                     "op": "subscribe",
                     "args": [{
@@ -101,7 +92,6 @@ async fn listen_websocket(tx: mpsc::Sender<String>, ws_sender: mpsc::Sender<Mess
                     continue;
                 }
 
-                // Process incoming messages
                 while let Some(message) = read.next().await {
                     if ORDER_EXECUTED.load(Ordering::Relaxed) {
                         return;
@@ -109,83 +99,45 @@ async fn listen_websocket(tx: mpsc::Sender<String>, ws_sender: mpsc::Sender<Mess
 
                     match message {
                         Ok(msg) => {
-                            println!("📩 Received WebSocket message: {}", msg); // Log all incoming messages
-
                             if let Ok(json_msg) = serde_json::from_str::<Value>(&msg.to_string()) {
-                                println!("📊 Parsed JSON message: {:?}", json_msg); // Log parsed JSON
-
-                                // Check if the message is a snapshot or update for the target token
                                 if let Some(action) = json_msg.get("action").and_then(Value::as_str) {
-                                    if action == "snapshot" || action == "update" {
-                                        if let Some(inst_id) = json_msg.get("arg").and_then(|a| a.get("instId")).and_then(Value::as_str) {
-                                            if inst_id == TARGET_TOKEN {
-                                                println!("🚨 TARGET TOKEN DETECTED via WebSocket: {}", inst_id);
-
-                                                // Execute order immediately
-                                                if !ORDER_EXECUTED.load(Ordering::Relaxed) {
-                                                    let _ = execute_sell_order(&ws_sender).await;
-                                                }
-
-                                                // Notify through channel as backup
-                                                let _ = tx.try_send(inst_id.to_string());
-                                            }
-                                        }
+                                    if (action == "snapshot" || action == "update") &&
+                                        json_msg.get("arg").and_then(|a| a.get("instId")).and_then(Value::as_str) == Some(TARGET_TOKEN) {
+                                        println!("🚨 Token {} detected as listed!", TARGET_TOKEN);
+                                        execute_sell_order(&ws_sender).await;
+                                        return; // Exit after successful execution
                                     }
                                 }
                             }
                         }
                         Err(e) => {
-                            println!("WebSocket error: {}. Reconnecting...", e);
+                            println!("❌ WebSocket error: {}. Reconnecting...", e);
                             break;
                         }
                     }
                 }
             }
             Err(e) => {
-                println!("❌ WebSocket connection failed: {}. Retrying in 1s...", e);
+                println!("❌ WebSocket connection failed: {}. Retrying...", e);
                 sleep(Duration::from_secs(1)).await;
             }
         }
     }
 }
 
-/// Main async function
 #[tokio::main]
 async fn main() {
     println!("🚀 Starting Bitget HFT Bot at {:?}", SystemTime::now());
     println!("🎯 Targeting token: {}", TARGET_TOKEN);
 
-    // Channel for communicating token detection
-    let (tx, mut rx) = mpsc::channel::<String>(64);
-
-    // Channel for sending WebSocket messages
     let (ws_sender, mut ws_receiver) = mpsc::channel::<Message>(64);
 
-    // Spawn WebSocket listener
-    let ws_tx = tx.clone();
-    let ws_sender_clone = ws_sender.clone();
-    tokio::spawn(async move {
-        listen_websocket(ws_tx, ws_sender_clone).await;
-    });
+    // Spawn the WebSocket listener and executor
+    tokio::spawn(check_and_execute(ws_sender.clone()));
 
-    // Spawn WebSocket message handler
-    tokio::spawn(async move {
-        while let Some(msg) = ws_receiver.recv().await {
-            println!("📩 WebSocket message: {}", msg);
-        }
-    });
-
-    // Wait for token detection and execute order
-    while let Some(_coin_symbol) = rx.recv().await {
-        if ORDER_EXECUTED.load(Ordering::Relaxed) {
-            println!("✅ Order already executed, exiting execution loop.");
-            break;
-        }
-
-        if execute_sell_order(&ws_sender).await {
-            println!("🎉 Bot finished: Sell order executed successfully!");
-            break;
-        }
+    // Handle WebSocket messages
+    while let Some(msg) = ws_receiver.recv().await {
+        println!("📩 WebSocket message sent: {}", msg);
     }
 
     println!("🏁 Bot execution complete");
