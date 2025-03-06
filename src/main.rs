@@ -114,7 +114,27 @@ async fn execute_sell_order(client: &Arc<Client>) -> bool {
     }
 }
 
-/// Optimized WebSocket listener with minimal processing
+/// Check if token is already listed via REST API
+async fn check_token_status(client: &Arc<Client>) -> bool {
+    let endpoint = format!("{}/api/spot/v1/public/products", API_BASE_URL);
+    match client.get(&endpoint).timeout(Duration::from_millis(500)).send().await {
+        Ok(resp) => {
+            if let Ok(json_resp) = resp.json::<Value>().await {
+                if json_resp["data"].as_array()
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .any(|item| item["symbolName"].as_str() == Some(TARGET_TOKEN) && item["status"].as_str() == Some("online")) {
+                    println!("🚨 Token {} is already listed!", TARGET_TOKEN);
+                    return true;
+                }
+            }
+        }
+        Err(e) => println!("❌ Failed to check token status: {}", e),
+    }
+    false
+}
+
+/// Optimized WebSocket listener with debug logging
 async fn listen_websocket(client: Arc<Client>, tx: mpsc::Sender<()>) {
     println!("🔗 Connecting to WebSocket");
 
@@ -139,25 +159,35 @@ async fn listen_websocket(client: Arc<Client>, tx: mpsc::Sender<()>) {
                 }).to_string());
 
                 if write.send(subscribe_msg).await.is_err() {
+                    println!("❌ Failed to send subscription message");
                     sleep(Duration::from_millis(100)).await;
                     continue;
                 }
+                println!("📡 Subscribed to ticker channel for {}", TARGET_TOKEN);
 
                 while let Some(message) = read.next().await {
                     if ORDER_EXECUTED.load(Ordering::Relaxed) {
                         return;
                     }
 
-                    if let Ok(msg) = message {
-                        if let Ok(json_msg) = serde_json::from_str::<Value>(&msg.to_string()) {
-                            if json_msg.get("action").and_then(Value::as_str) == Some("update") &&
-                               json_msg.get("arg").and_then(|a| a.get("instId")).and_then(Value::as_str) == Some(TARGET_TOKEN) {
-                                println!("🚨 TARGET TOKEN DETECTED via WebSocket!");
-                                let _ = tx.try_send(());
-                                // Execute immediately in this thread for lowest latency
-                                execute_sell_order(&client).await;
-                                return; // Exit after detection to avoid duplicate triggers
+                    match message {
+                        Ok(msg) => {
+                            if let Ok(text) = msg.to_text() {
+                                println!("📥 WebSocket message: {}", text); // Log raw message for debugging
+                                if let Ok(json_msg) = serde_json::from_str::<Value>(text) {
+                                    if json_msg.get("action").and_then(Value::as_str) == Some("update") &&
+                                       json_msg.get("arg").and_then(|a| a.get("instId")).and_then(Value::as_str) == Some(TARGET_TOKEN) {
+                                        println!("🚨 TARGET TOKEN DETECTED via WebSocket!");
+                                        let _ = tx.try_send(());
+                                        execute_sell_order(&client).await;
+                                        return;
+                                    }
+                                }
                             }
+                        }
+                        Err(e) => {
+                            println!("❌ WebSocket message error: {}", e);
+                            break;
                         }
                     }
                 }
@@ -191,24 +221,32 @@ async fn main() {
 
     // Optimized HTTP client
     let client = Arc::new(ClientBuilder::new()
-        .tcp_nodelay(true) // Disable Nagle's algorithm for lower latency
+        .tcp_nodelay(true)
         .tcp_keepalive(Some(Duration::from_secs(10)))
         .pool_max_idle_per_host(50)
-        .danger_accept_invalid_certs(true) // Use with caution
+        .danger_accept_invalid_certs(true)
         .build()
         .expect("Failed to build HTTP client"));
 
     warm_up_connections(&client).await;
 
+    // Check if token is already listed
+    if check_token_status(&client).await {
+        if execute_sell_order(&client).await {
+            println!("🏁 HFT Bot execution complete (token already listed)");
+            return;
+        }
+    }
+
     let (tx, mut rx) = mpsc::channel::<()>(1);
 
-    // Spawn WebSocket listener with direct execution
+    // Spawn WebSocket listener
     let ws_client = client.clone();
     tokio::spawn(async move {
         listen_websocket(ws_client, tx).await;
     });
 
-    // Main loop - minimal overhead
+    // Main loop
     while rx.recv().await.is_some() {
         if ORDER_EXECUTED.load(Ordering::Relaxed) {
             break;
