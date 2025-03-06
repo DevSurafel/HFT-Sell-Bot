@@ -17,7 +17,7 @@ const API_KEY: &str = "bg_2b02e2a62b65685cee763cc916285ed3";
 const SECRET_KEY: &str = "c347ccb5f4d73d8928f3c3a54258707e3bf2013400c38003fd5192d61dbeccae";
 const PASSPHRASE: &str = "HFTSellNow";
 const TARGET_TOKEN: &str = "BGBUSDT";
-const COIN_AMOUNT: &str = "0.1333"; // Adjust based on balance
+const COIN_AMOUNT: &str = "0.34591"; // Adjust based on balance
 const WS_URL: &str = "wss://ws.bitget.com/spot/v1/stream";
 
 // Pre-compute formatted symbol
