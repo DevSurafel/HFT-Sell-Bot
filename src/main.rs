@@ -19,7 +19,7 @@ const API_KEY: &str = "bg_2b02e2a62b65685cee763cc916285ed3";
 const SECRET_KEY: &str = "c347ccb5f4d73d8928f3c3a54258707e3bf2013400c38003fd5192d61dbeccae";
 const PASSPHRASE: &str = "HFTSellNow";
 const TARGET_TOKEN: &str = "BGBUSDT";
-const COIN_AMOUNT: &str = "0.254"; // Adjust based on balance
+const COIN_AMOUNT: &str = "0.4239"; // Adjust based on balance
 
 // Endpoint constants
 const API_BASE_URL: &str = "https://api.bitget.com";
@@ -79,7 +79,7 @@ async fn prepare_presigned_template() {
     let body_str = base_payload.to_string();
     
     // Create signature template (without timestamp which will be added at execution time)
-    let signature_base = format!("{}POST{}", "", ORDER_PATH);
+    let signature_base = format!("POST{}", ORDER_PATH);
     
     *template = Some(PreSignedTemplate {
         base_payload: body_str,
@@ -212,7 +212,7 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
     
     // Finalize signature with current timestamp
     let final_signature_base = format!("{}{}{}", timestamp, template.signature_base, template.base_payload);
-    let signature = sign_request(&timestamp, "", "", &final_signature_base);
+    let signature = sign_request(&timestamp, "POST", ORDER_PATH, &final_signature_base);
     
     println!("⏱ Pre-execution preparation: {:?}", start_time.elapsed());
     let request_start = Instant::now();
