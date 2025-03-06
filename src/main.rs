@@ -46,6 +46,7 @@ struct BalanceCache {
 static BALANCE_CACHE: Lazy<Mutex<Option<BalanceCache>>> = Lazy::new(|| Mutex::new(None));
 
 // Pre-signed request template for order execution
+#[derive(Clone)]
 struct PreSignedTemplate {
     base_payload: String,
     signature_base: String,
@@ -196,20 +197,21 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
         .as_millis()
         .to_string();
     
-    // Get pre-signed template for ultra-fast order preparation
-    let template = {
-        let template_lock = PRE_SIGNED_TEMPLATE.lock().await;
-        if let Some(template) = &*template_lock {
-            template.clone()
-        } else {
+    // Fix: Clone the template outside the lock scope
+    let template_lock = PRE_SIGNED_TEMPLATE.lock().await;
+    let template = match &*template_lock {
+        Some(t) => t.clone(),
+        None => {
             // Fallback if template not available - should never happen in production
             ORDER_IN_PROGRESS.store(false, Ordering::Release);
             return false;
         }
     };
+    // Drop the lock here
+    drop(template_lock);
     
     // Finalize signature with current timestamp
-    let final_signature_base = format!("{}{}", timestamp, template.signature_base);
+    let final_signature_base = format!("{}{}{}", timestamp, template.signature_base, template.base_payload);
     let signature = sign_request(&timestamp, "", "", &final_signature_base);
     
     println!("⏱ Pre-execution preparation: {:?}", start_time.elapsed());
@@ -222,7 +224,7 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
         .header("ACCESS-SIGN", &signature)
         .header("ACCESS-TIMESTAMP", &timestamp)
         .header("ACCESS-PASSPHRASE", PASSPHRASE)
-        .body(template.base_payload.clone())  // Use pre-formatted payload
+        .body(template.base_payload)  // Use pre-formatted payload
         .timeout(Duration::from_millis(300))  // Aggressive timeout
         .send()
         .await;
