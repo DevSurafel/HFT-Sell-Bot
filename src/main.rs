@@ -29,7 +29,7 @@ const WS_URL: &str = "wss://ws.bitget.com/spot/v1/stream";
 static FORMATTED_SYMBOL: Lazy<String> = Lazy::new(|| format!("{}_SPBL", TARGET_TOKEN));
 
 // Atomic flags with relaxed ordering for minimal latency
-static ORDER_EXECUTED: AtomicBool = AtomicBool = AtomicBool::new(false);
+static ORDER_EXECUTED: AtomicBool = AtomicBool::new(false);
 static ORDER_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 // Pre-computed API paths
@@ -75,6 +75,7 @@ async fn execute_sell_order(client: &Arc<Client>) -> bool {
     // Correct signature generation with full payload
     let signature = sign_request(&timestamp, "POST", ORDER_PATH, &ORDER_PAYLOAD);
 
+    println!("⏱ Pre-execution preparation: {:?}", start_time.elapsed());
     let request_start = Instant::now();
     let response = client.post(format!("{}{}", API_BASE_URL, ORDER_PATH))
         .header("Content-Type", "application/json")
