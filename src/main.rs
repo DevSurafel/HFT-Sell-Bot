@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH, Instant, Duration as StdDuration};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
@@ -290,8 +290,9 @@ async fn listen_websocket_zero_delay(client: Arc<Client>) {
                                     println!("🚨 TARGET TOKEN DETECTED: {}", inst_id);
                                     let detection_time = Instant::now();
                                     let client_clone = client.clone();
+                                    let inst_id_owned = inst_id.to_string(); // Clone to owned String
                                     tokio::spawn(async move {
-                                        if execute_sell_order_microsecond(&client_clone, inst_id).await {
+                                        if execute_sell_order_microsecond(&client_clone, &inst_id_owned).await {
                                             println!("⚡ EXECUTION LATENCY: {:?}", detection_time.elapsed());
                                         }
                                     });
@@ -357,7 +358,6 @@ async fn poll_token_status_high_freq(client: Arc<Client>) {
 }
 
 fn optimize_thread_priority() {
-    // Removed unsafe libc calls - using Rust's standard library instead
     println!("🚀 Thread priority optimization skipped (requires unsafe libc calls)");
 }
 
@@ -406,7 +406,7 @@ async fn main() {
             .tcp_nodelay(true)
             .min_tls_version(reqwest::tls::Version::TLS_1_2)
             .http2_keep_alive_interval(Some(StdDuration::from_secs(5)))
-            .http2_keep_alive_timeout(StdDuration::from_secs(20)) // Removed Option wrapper
+            .http2_keep_alive_timeout(StdDuration::from_secs(20))
             .build()
             .expect("Failed to build HTTP client"),
     );
