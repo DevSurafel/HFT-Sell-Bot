@@ -19,7 +19,7 @@ const API_KEY: &str = "bg_2b02e2a62b65685cee763cc916285ed3";
 const SECRET_KEY: &str = "c347ccb5f4d73d8928f3c3a54258707e3bf2013400c38003fd5192d61dbeccae";
 const PASSPHRASE: &str = "HFTSellNow";
 const TARGET_TOKEN: &str = "BGBUSDT";
-const COIN_AMOUNT: &str = "0.256";
+const COIN_AMOUNT: &str = "0.2570";
 
 // Endpoint constants
 const API_BASE_URL: &str = "https://api.bitget.com";
@@ -73,26 +73,67 @@ async fn pre_validate_balance(client: &Arc<HyperClient<HttpsConnector<hyper::cli
     let start = Instant::now();
     match client.request(req).await {
         Ok(resp) => {
+            let status = resp.status();
             let body = hyper::body::to_bytes(resp.into_body()).await.unwrap();
-            let json: Value = serde_json::from_slice(&body).unwrap_or_default();
+            println!("📋 Balance API response status: {}", status);
+            println!("📋 Raw response body: {:?}", String::from_utf8_lossy(&body));
+
+            if !status.is_success() {
+                println!("❌ Balance request failed with status: {}", status);
+                return false;
+            }
+
+            let json: Value = match serde_json::from_slice(&body) {
+                Ok(val) => val,
+                Err(e) => {
+                    println!("❌ Failed to parse JSON: {}", e);
+                    return false;
+                }
+            };
+
             let coin_prefix = TARGET_TOKEN.split('_').next().unwrap_or(TARGET_TOKEN);
+            println!("🔍 Looking for coin: {}", coin_prefix);
+
             if let Some(assets) = json["data"].as_array() {
+                println!("📊 Found {} assets in response", assets.len());
                 for asset in assets {
-                    if asset["coin"].as_str() == Some(coin_prefix) {
+                    let coin = asset["coin"].as_str();
+                    println!("🔎 Checking asset: {:?}", asset);
+                    if coin == Some(coin_prefix) {
                         if let Some(avail) = asset["available"].as_str() {
-                            if let Ok(balance) = avail.parse::<f64>() {
-                                let amount = COIN_AMOUNT.parse::<f64>().unwrap_or(0.0);
-                                println!("⏱ Balance check latency: {:?}", start.elapsed());
-                                return balance >= amount;
+                            match avail.parse::<f64>() {
+                                Ok(balance) => {
+                                    let amount = COIN_AMOUNT.parse::<f64>().unwrap_or(0.0);
+                                    println!("💰 Available balance: {}, Required: {}", balance, amount);
+                                    println!("⏱ Balance check latency: {:?}", start.elapsed());
+                                    if balance >= amount {
+                                        println!("✅ Sufficient balance confirmed");
+                                        return true;
+                                    } else {
+                                        println!("❌ Insufficient balance: {} < {}", balance, amount);
+                                        return false;
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("❌ Failed to parse balance: {}", e);
+                                    return false;
+                                }
                             }
+                        } else {
+                            println!("❌ No 'available' field in asset: {:?}", asset);
+                            return false;
                         }
                     }
                 }
+                println!("❌ Coin {} not found in assets", coin_prefix);
+                false
+            } else {
+                println!("❌ No 'data' array in response: {:?}", json);
+                false
             }
-            false
         }
         Err(e) => {
-            println!("❌ Balance check failed: {}", e);
+            println!("❌ Balance request failed: {}", e);
             false
         }
     }
@@ -131,7 +172,7 @@ async fn execute_sell_order(client: &Arc<HyperClient<HttpsConnector<hyper::clien
                 true
             } else {
                 let body = hyper::body::to_bytes(resp.into_body()).await.unwrap();
-                println!("❌ Order failed: {} - {:?}", status, body);
+                println!("❌ Order failed: {} - {:?}", status, String::from_utf8_lossy(&body));
                 false
             }
         }
@@ -171,7 +212,6 @@ async fn listen_websocket(client: Arc<HyperClient<HttpsConnector<hyper::client::
 
                     if let Ok(msg) = message {
                         let text = msg.to_string();
-                        // Fast check for target token in raw message
                         if text.contains(TARGET_TOKEN) && text.contains("\"action\":\"update\"") {
                             println!("🚨 Token detected in {:?} via WebSocket", start.elapsed());
                             if execute_sell_order(&client).await {
@@ -212,24 +252,20 @@ async fn warm_up_connections(client: &Arc<HyperClient<HttpsConnector<hyper::clie
 async fn main() {
     println!("🚀 Starting HFT Bot at {:?}", SystemTime::now());
 
-    // Hyper client with HTTPS
     let https = HttpsConnector::new();
     let client = Arc::new(HyperClient::builder().build::<_, hyper::Body>(https));
 
-    // Warm up and validate balance
     warm_up_connections(&client).await;
     if !pre_validate_balance(&client).await {
         println!("❌ Insufficient balance or validation failed");
         return;
     }
 
-    // Spawn WebSocket listener
     let ws_client = client.clone();
     tokio::spawn(async move {
         listen_websocket(ws_client).await;
     });
 
-    // Keep main thread alive
     while !ORDER_EXECUTED.load(Ordering::SeqCst) {
         sleep(Duration::from_millis(100)).await;
     }
