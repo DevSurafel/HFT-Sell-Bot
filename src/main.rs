@@ -1,6 +1,5 @@
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use futures_util::{StreamExt, SinkExt};
-use reqwest::{Client, ClientBuilder};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use base64::{engine::general_purpose, Engine};
@@ -8,10 +7,9 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::Duration;
 use once_cell::sync::Lazy;
-use std::net::TcpStream;
 use http::Request;
 use hyper::{Body, Client as HyperClient, client::HttpConnector};
 use hyper_tls::HttpsConnector;
