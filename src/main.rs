@@ -19,7 +19,7 @@ const API_KEY: &str = "bg_2b02e2a62b65685cee763cc916285ed3";
 const SECRET_KEY: &str = "c347ccb5f4d73d8928f3c3a54258707e3bf2013400c38003fd5192d61dbeccae";
 const PASSPHRASE: &str = "HFTSellNow";
 const TARGET_TOKEN: &str = "BGBUSDT";
-const COIN_AMOUNT: &str = "0.2567"; // Adjust based on balance
+const COIN_AMOUNT: &str = "0.2562"; // Adjust based on balance
 
 // Endpoint constants
 const API_BASE_URL: &str = "https://api.bitget.com";
@@ -43,6 +43,26 @@ struct BalanceCache {
 }
 
 static BALANCE_CACHE: Lazy<Mutex<Option<BalanceCache>>> = Lazy::new(|| Mutex::new(None));
+
+// Precompute the order request body and signature
+static ORDER_BODY: Lazy<String> = Lazy::new(|| {
+    json!({
+        "symbol": *FORMATTED_SYMBOL,
+        "side": "sell",
+        "orderType": "market",
+        "quantity": COIN_AMOUNT,
+        "force": "gtc"
+    }).to_string()
+});
+
+static ORDER_SIGNATURE: Lazy<String> = Lazy::new(|| {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .to_string();
+    sign_request(&timestamp, "POST", ORDER_PATH, &ORDER_BODY)
+});
 
 /// Generates an HMAC-SHA256 signature
 #[inline]
@@ -159,17 +179,6 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
         .as_millis()
         .to_string();
 
-    let body = json!({
-        "symbol": *FORMATTED_SYMBOL,
-        "side": "sell",
-        "orderType": "market",
-        "quantity": COIN_AMOUNT,
-        "force": "gtc"
-    });
-
-    let body_str = body.to_string();
-    let signature = sign_request(&timestamp, "POST", ORDER_PATH, &body_str);
-
     println!("⏱ Preparation time: {:?}", start_time.elapsed());
     let request_start = Instant::now();
 
@@ -178,10 +187,10 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
         .post(format!("{}{}", API_BASE_URL, ORDER_PATH))
         .header("Content-Type", "application/json")
         .header("ACCESS-KEY", API_KEY)
-        .header("ACCESS-SIGN", &signature)
+        .header("ACCESS-SIGN", &ORDER_SIGNATURE)
         .header("ACCESS-TIMESTAMP", &timestamp)
         .header("ACCESS-PASSPHRASE", PASSPHRASE)
-        .json(&body)
+        .body(ORDER_BODY.clone())
         .timeout(Duration::from_millis(800))
         .send()
         .await;
