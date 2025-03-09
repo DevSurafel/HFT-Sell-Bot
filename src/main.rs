@@ -7,12 +7,10 @@ use base64::{engine::general_purpose, Engine};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH, Instant, Duration as StdDuration};
+use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, Duration};
 use once_cell::sync::Lazy;
-use std::thread;
-use std::collections::HashMap;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -38,9 +36,16 @@ static ORDER_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 const BALANCE_PATH: &str = "/api/spot/v1/account/assets";
 const ORDER_PATH: &str = "/api/spot/v1/trade/orders";
 
-// Pre-computed HTTP headers and request templates
-static PRE_COMPUTED_HEADERS: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
-static PRE_COMPUTED_ORDER_BODY: Lazy<String> = Lazy::new(|| {
+// Cache the balance check to avoid redundant API calls
+struct BalanceCache {
+    timestamp: Instant,
+    balance: f64,
+}
+
+static BALANCE_CACHE: Lazy<Mutex<Option<BalanceCache>>> = Lazy::new(|| Mutex::new(None));
+
+// Precompute the order request body and signature
+static ORDER_BODY: Lazy<String> = Lazy::new(|| {
     json!({
         "symbol": *FORMATTED_SYMBOL,
         "side": "sell",
@@ -50,16 +55,17 @@ static PRE_COMPUTED_ORDER_BODY: Lazy<String> = Lazy::new(|| {
     }).to_string()
 });
 
-// Cache the balance check to avoid redundant API calls
-struct BalanceCache {
-    timestamp: Instant,
-    balance: f64,
-}
+static ORDER_SIGNATURE: Lazy<String> = Lazy::new(|| {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .to_string();
+    sign_request(&timestamp, "POST", ORDER_PATH, &ORDER_BODY)
+});
 
-static BALANCE_CACHE: Lazy<Mutex<Option<BalanceCache>>> = Lazy::new(|| Mutex::new(None));
-
-/// Generates an HMAC-SHA256 signature with inline optimization
-#[inline(always)]
+/// Generates an HMAC-SHA256 signature
+#[inline]
 fn sign_request(timestamp: &str, method: &str, path: &str, body: &str) -> String {
     let message = format!("{}{}{}{}", timestamp, method, path, body);
     let mut mac = HmacSha256::new_from_slice(SECRET_KEY.as_bytes()).expect("HMAC initialization failed");
@@ -67,14 +73,14 @@ fn sign_request(timestamp: &str, method: &str, path: &str, body: &str) -> String
     general_purpose::STANDARD.encode(mac.finalize().into_bytes())
 }
 
-/// Checks account balance for the token with aggressive caching
+/// Checks account balance for the token with caching
 async fn check_balance(client: &Arc<Client>, coin_symbol: &str) -> Option<f64> {
     // Check cache first to avoid redundant API calls
     {
         let cache = BALANCE_CACHE.lock().await;
         if let Some(cached) = &*cache {
-            // Use cached balance if less than 10 seconds old
-            if cached.timestamp.elapsed() < Duration::from_secs(10) {
+            // Use cached balance if less than 5 seconds old
+            if cached.timestamp.elapsed() < Duration::from_secs(5) {
                 return Some(cached.balance);
             }
         }
@@ -134,155 +140,156 @@ async fn check_balance(client: &Arc<Client>, coin_symbol: &str) -> Option<f64> {
     }
 }
 
-/// Pre-computes and caches request headers and signatures for ultra-low latency
-async fn pre_compute_order_request(client: &Arc<Client>) -> Result<(), Box<dyn std::error::Error>> {
-    println!("⚡ Pre-computing order request components for microsecond execution...");
-    
-    // Pre-compute timestamp and signature
+/// Prepares and executes a sell order with minimal latency
+async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
+    // Prevent concurrent order execution attempts
+    if ORDER_EXECUTED.load(Ordering::SeqCst) {
+        println!("⚠️ Order already executed, skipping duplicate.");
+        return true;
+    }
+
+    if ORDER_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        println!("⚠️ Order execution already in progress, skipping duplicate attempt.");
+        return false;
+    }
+
+    // Attempt to get cached balance or fetch if needed
+    let start_time = Instant::now();
+    let balance = check_balance(client, coin_symbol).await;
+    let amount: f64 = COIN_AMOUNT.parse().unwrap_or(0.0);
+
+    if let Some(avail) = balance {
+        if avail < amount {
+            println!(
+                "⚠️ Insufficient balance: {} available, {} requested",
+                avail, amount
+            );
+            ORDER_IN_PROGRESS.store(false, Ordering::SeqCst);
+            return false;
+        }
+    }
+
+    // Prepare order request - precompute as much as possible
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis()
         .to_string();
-    
-    let signature = sign_request(&timestamp, "POST", ORDER_PATH, &PRE_COMPUTED_ORDER_BODY);
-    
-    let mut headers = PRE_COMPUTED_HEADERS.lock().await;
-    headers.insert("Content-Type".to_string(), "application/json".to_string());
-    headers.insert("ACCESS-KEY".to_string(), API_KEY.to_string());
-    headers.insert("ACCESS-SIGN".to_string(), signature);
-    headers.insert("ACCESS-TIMESTAMP".to_string(), timestamp);
-    headers.insert("ACCESS-PASSPHRASE".to_string(), PASSPHRASE.to_string());
-    
-    // Perform a test request to warm up connection pool and DNS cache
-    let test_req = client
-        .get(format!("{}/api/spot/v1/public/time", API_BASE_URL))
+
+    println!("⏱ Preparation time: {:?}", start_time.elapsed());
+    let request_start = Instant::now();
+
+    // Execute with minimal timeout for urgency
+    let response = client
+        .post(format!("{}{}", API_BASE_URL, ORDER_PATH))
+        .header("Content-Type", "application/json")
+        .header("ACCESS-KEY", API_KEY)
+        .header("ACCESS-SIGN", &*ORDER_SIGNATURE) // Dereference Lazy<String> to get &str
+        .header("ACCESS-TIMESTAMP", &timestamp)
+        .header("ACCESS-PASSPHRASE", PASSPHRASE)
+        .body(ORDER_BODY.clone())
+        .timeout(Duration::from_millis(800))
         .send()
-        .await?;
-    
-    if test_req.status().is_success() {
-        println!("✅ Pre-computed request components and warmed connections");
-        Ok(())
-    } else {
-        Err("Failed to warm up API connection".into())
-    }
-}
+        .await;
 
-/// Ultra-optimized sell order execution with microsecond precision
-async fn execute_sell_order_microsecond(client: &Arc<Client>, coin_symbol: &str) -> bool {
-    // Prevent concurrent order execution attempts with memory ordering optimized for speed
-    if ORDER_EXECUTED.load(Ordering::Relaxed) {
-        return true;
-    }
-
-    if ORDER_IN_PROGRESS.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-        return false;
-    }
-
-    // Use dedicated high-priority thread for API request
-    let client_clone = client.clone();
-    
-    // Start precise timing for microsecond measurement
-    let start_nano = std::time::Instant::now();
-    
-    // Create a fresh timestamp for this exact execution moment
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_micros()
-        .to_string();
-    
-    // Compute signature with the fresh timestamp for this specific execution
-    let signature = sign_request(&timestamp, "POST", ORDER_PATH, &PRE_COMPUTED_ORDER_BODY);
-    
-    // Use thread priority boost for the sell order execution
-    let execution_handle = tokio::task::spawn_blocking(move || {
-        // Set current thread to highest priority if on Linux
-        #[cfg(target_os = "linux")]
-        unsafe {
-            libc::pthread_setschedprio(libc::pthread_self(), 99);
-        }
-        
-        // Create a blocking client for more direct network control
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        
-        runtime.block_on(async {
-            // Execute with absolute minimal timeout for urgency - 200ms
-            client_clone
-                .post(format!("{}{}", API_BASE_URL, ORDER_PATH))
-                .header("Content-Type", "application/json")
-                .header("ACCESS-KEY", API_KEY)
-                .header("ACCESS-SIGN", &signature)
-                .header("ACCESS-TIMESTAMP", &timestamp)
-                .header("ACCESS-PASSPHRASE", PASSPHRASE)
-                .body(PRE_COMPUTED_ORDER_BODY.to_string())
-                .timeout(Duration::from_millis(200))
-                .send()
-                .await
-        })
-    });
-    
-    // Wait for the high-priority execution to complete
-    let response = match execution_handle.await {
-        Ok(result) => result,
-        Err(e) => {
-            println!("❌ Thread execution failed: {}", e);
-            ORDER_IN_PROGRESS.store(false, Ordering::Release);
-            return false;
-        }
-    };
-    
-    // Calculate elapsed time in microseconds for precise measurement
-    let elapsed_micros = start_nano.elapsed().as_micros();
-    println!("⏱️ Sell order execution time: {} microseconds", elapsed_micros);
+    let elapsed = request_start.elapsed();
+    println!("⏱ Sell order request latency: {:?}", elapsed);
 
     match response {
         Ok(resp) => {
             let status = resp.status();
-            let text = match resp.text().await {
-                Ok(t) => t,
-                Err(_) => "Unknown error".to_string()
-            };
-            
+            let text = resp.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            println!("📊 Response Status: {} | {}", status, text);
+
             if status.is_success() {
-                ORDER_EXECUTED.store(true, Ordering::Release);
-                ORDER_IN_PROGRESS.store(false, Ordering::Release);
-                println!("✅ SELL ORDER PLACED IN {} MICROSECONDS!", elapsed_micros);
-                println!("✅ Response: {}", text);
+                ORDER_EXECUTED.store(true, Ordering::SeqCst);
+                ORDER_IN_PROGRESS.store(false, Ordering::SeqCst);
+                println!(
+                    "✅ SELL ORDER PLACED FOR {} at {:?}",
+                    *FORMATTED_SYMBOL,
+                    SystemTime::now()
+                );
                 return true;
             } else {
-                ORDER_IN_PROGRESS.store(false, Ordering::Release);
+                ORDER_IN_PROGRESS.store(false, Ordering::SeqCst);
                 println!("❌ API ERROR: {}", text);
                 return false;
             }
         }
         Err(e) => {
-            ORDER_IN_PROGRESS.store(false, Ordering::Release);
+            ORDER_IN_PROGRESS.store(false, Ordering::SeqCst);
             println!("❌ REQUEST FAILED: {}", e);
             return false;
         }
     }
 }
 
-/// Zero-delay WebSocket listener with direct execution on detection
-async fn listen_websocket_zero_delay(client: Arc<Client>) {
-    println!("🔗 Connecting to WebSocket with zero-delay execution path: {}", WS_URL);
+/// Polling function optimized for lower CPU usage but still fast response
+async fn poll_token_status(client: Arc<Client>, tx: mpsc::Sender<String>) {
+    let endpoint = format!("{}/api/spot/v1/public/products", API_BASE_URL);
+    let mut backoff = 50; // Start with 50ms polling interval
 
     loop {
-        if ORDER_EXECUTED.load(Ordering::Relaxed) {
+        if ORDER_EXECUTED.load(Ordering::SeqCst) {
+            println!("✅ Polling stopped: Order executed successfully.");
+            return;
+        }
+
+        match client
+            .get(&endpoint)
+            .timeout(Duration::from_millis(800))
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                if let Ok(json_resp) = resp.json::<Value>().await {
+                    // Reset backoff on successful response
+                    backoff = 50;
+
+                    if json_resp["data"]
+                        .as_array()
+                        .unwrap_or(&vec![])
+                        .iter()
+                        .any(|item| item["symbolName"] == TARGET_TOKEN && item["status"] == "online")
+                    {
+                        println!("🚨 Token {} detected via polling!", TARGET_TOKEN);
+                        let _ = tx.try_send(TARGET_TOKEN.to_string());
+                    }
+                }
+            }
+            Err(e) => {
+                println!("Polling error: {}. Retrying with backoff...", e);
+                // Increase backoff on error, cap at 500ms
+                backoff = (backoff * 2).min(500);
+            }
+        }
+
+        sleep(Duration::from_millis(backoff)).await;
+    }
+}
+
+/// Optimized WebSocket listener
+async fn listen_websocket(tx: mpsc::Sender<String>) {
+    println!("🔗 Connecting to WebSocket: {}", WS_URL);
+
+    loop {
+        if ORDER_EXECUTED.load(Ordering::SeqCst) {
             println!("✅ WebSocket stopped: Order executed successfully.");
             return;
         }
 
         match connect_async(WS_URL).await {
             Ok((ws_stream, _)) => {
-                println!("✅ WebSocket connected with zero-delay configuration!");
-                let (mut write, mut read) = ws_stream.split();
+                println!("✅ WebSocket connected!");
+                let (mut write, read) = ws_stream.split(); // Removed `mut` from `read`
 
-                // Subscribe message with higher priority
+                // Ping message to keep connection alive
+                let ping_msg = json!({"op": "ping"});
+
+                // Subscribe message
                 let subscribe_msg = json!({
                     "op": "subscribe",
                     "args": [{
@@ -292,24 +299,44 @@ async fn listen_websocket_zero_delay(client: Arc<Client>) {
                     }]
                 });
 
-                // Send subscribe message with priority
+                // Send subscribe message
                 if let Err(e) = write.send(Message::Text(subscribe_msg.to_string())).await {
                     println!("❌ Failed to subscribe: {}. Reconnecting...", e);
-                    sleep(Duration::from_millis(100)).await;
+                    sleep(Duration::from_secs(1)).await;
                     continue;
                 }
 
-                // Process incoming messages with zero delay execution path
-                let client_clone = client.clone();
-                while let Some(message) = read.next().await {
-                    if ORDER_EXECUTED.load(Ordering::Relaxed) {
+                // Start ping task
+                let write_clone = write.reunite(read).unwrap();
+
+                let (mut ws_write, ws_read) = write_clone.split(); // Removed `mut` from `ws_read`
+
+                // Spawn a ping task to keep connection alive
+                let ping_task = tokio::spawn(async move {
+                    loop {
+                        if ORDER_EXECUTED.load(Ordering::SeqCst) {
+                            return;
+                        }
+
+                        if let Err(e) = ws_write.send(Message::Text(ping_msg.to_string())).await {
+                            println!("❌ Failed to send ping: {}", e);
+                            return;
+                        }
+
+                        sleep(Duration::from_secs(15)).await;
+                    }
+                });
+
+                // Process incoming messages
+                while let Some(message) = ws_read.next().await {
+                    if ORDER_EXECUTED.load(Ordering::SeqCst) {
+                        ping_task.abort();
                         println!("✅ WebSocket stopped: Order executed successfully.");
                         return;
                     }
 
                     match message {
                         Ok(msg) => {
-                            // Parse with minimal overhead
                             if let Ok(json_msg) = serde_json::from_str::<Value>(&msg.to_string()) {
                                 if json_msg.get("action").and_then(Value::as_str) == Some("update") {
                                     if let Some(inst_id) = json_msg
@@ -318,15 +345,12 @@ async fn listen_websocket_zero_delay(client: Arc<Client>) {
                                         .and_then(Value::as_str)
                                     {
                                         if inst_id == TARGET_TOKEN {
-                                            println!("🚨 TARGET TOKEN DETECTED via WebSocket: {}", inst_id);
-                                            
-                                            // Execute order directly without channel overhead
-                                            let detection_time = Instant::now();
-                                            tokio::spawn(async move {
-                                                if execute_sell_order_microsecond(&client_clone, inst_id).await {
-                                                    println!("⚡ EXECUTION LATENCY: {:?}", detection_time.elapsed());
-                                                }
-                                            });
+                                            println!(
+                                                "🚨 TARGET TOKEN DETECTED via WebSocket: {}",
+                                                inst_id
+                                            );
+                                            // Use try_send to avoid blocking
+                                            let _ = tx.try_send(inst_id.to_string());
                                         }
                                     }
                                 }
@@ -334,177 +358,135 @@ async fn listen_websocket_zero_delay(client: Arc<Client>) {
                         }
                         Err(e) => {
                             println!("WebSocket error: {}. Reconnecting...", e);
+                            ping_task.abort();
                             break;
                         }
                     }
                 }
             }
             Err(e) => {
-                println!("❌ WebSocket connection failed: {}. Retrying in 500ms...", e);
-                sleep(Duration::from_millis(500)).await;
+                println!("❌ WebSocket connection failed: {}. Retrying in 1s...", e);
+                sleep(Duration::from_secs(1)).await;
             }
         }
     }
 }
 
-/// High-frequency polling with aggressive timeouts and direct execution path
-async fn poll_token_status_high_freq(client: Arc<Client>) {
-    let endpoint = format!("{}/api/spot/v1/public/products", API_BASE_URL);
-    let polling_interval = Duration::from_millis(20); // 20ms polling for high frequency
+/// Warm up connection and DNS cache
+async fn warm_up_connections(client: &Arc<Client>) {
+    println!("🔥 Warming up connections and DNS cache...");
 
-    loop {
-        if ORDER_EXECUTED.load(Ordering::Relaxed) {
-            println!("✅ Polling stopped: Order executed successfully.");
-            return;
-        }
+    // Prefetch DNS and establish connection pool
+    let endpoints = [
+        format!("{}/api/spot/v1/public/time", API_BASE_URL),
+        format!("{}{}", API_BASE_URL, BALANCE_PATH),
+        format!("{}{}", API_BASE_URL, ORDER_PATH),
+    ];
 
-        let poll_start = Instant::now();
-        match client
-            .get(&endpoint)
-            .timeout(Duration::from_millis(150))
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                if let Ok(json_resp) = resp.json::<Value>().await {
-                    if json_resp["data"]
-                        .as_array()
-                        .unwrap_or(&vec![])
-                        .iter()
-                        .any(|item| item["symbolName"] == TARGET_TOKEN && item["status"] == "online")
-                    {
-                        println!("🚨 Token {} detected via polling in {:?}!", TARGET_TOKEN, poll_start.elapsed());
-                        
-                        // Direct execution path without channel overhead
-                        if execute_sell_order_microsecond(&client, TARGET_TOKEN).await {
-                            println!("⚡ Direct execution from polling completed!");
-                            return;
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                if !e.is_timeout() {
-                    println!("Polling error: {}. Continuing...", e);
-                }
-            }
-        }
-
-        // Adaptive sleep to maintain polling frequency
-        let elapsed = poll_start.elapsed();
-        if elapsed < polling_interval {
-            sleep(polling_interval - elapsed).await;
-        }
-    }
-}
-
-/// Sets up CPU affinity and priority for the main thread
-fn optimize_thread_priority() {
-    // Set thread priority to maximum if on Unix-like systems
-    #[cfg(target_os = "linux")]
-    unsafe {
-        // Set the process priority to real-time
-        libc::setpriority(libc::PRIO_PROCESS, 0, -20);
-        
-        // Lock memory to prevent swapping
-        libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE);
-        
-        // Set CPU affinity to core 0 (typically has lower latency)
-        let mut cpu_set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_SET(0, &mut cpu_set);
-        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &cpu_set);
-        
-        // Set scheduler to SCHED_FIFO (real-time scheduler)
-        let mut param: libc::sched_param = std::mem::zeroed();
-        param.sched_priority = 99; // Max priority
-        libc::sched_setscheduler(0, libc::SCHED_FIFO, &param);
-    }
-    
-    println!("🚀 Thread priorities optimized for microsecond execution");
-}
-
-/// Pre-generates order templates and warms up system
-async fn pre_warm_system(client: &Arc<Client>) {
-    println!("🔥 Pre-warming system for microsecond execution...");
-    
-    // Pre-compute order request components
-    if let Err(e) = pre_compute_order_request(client).await {
-        println!("⚠️ Failed to pre-compute order request: {}", e);
-    }
-    
-    // Pre-fetch balance
-    if let Some(balance) = check_balance(client, TARGET_TOKEN).await {
-        println!("✅ Balance pre-fetched: {} {}", balance, TARGET_TOKEN);
-    }
-    
-    // Perform rapid connection tests to warm up network stack
     let mut handles = Vec::new();
-    for _ in 0..5 {
+
+    for endpoint in endpoints {
         let client_clone = client.clone();
         let handle = tokio::spawn(async move {
-            let _ = client_clone
-                .get(format!("{}/api/spot/v1/public/time", API_BASE_URL))
-                .timeout(Duration::from_millis(500))
-                .send()
-                .await;
+            let _ = client_clone.get(&endpoint).send().await;
         });
         handles.push(handle);
     }
-    
+
+    // Wait for all warmup requests to complete
     for handle in handles {
         let _ = handle.await;
     }
-    
-    println!("✅ System pre-warming complete - ready for microsecond execution");
+
+    println!("✅ Connection warmup complete");
+}
+
+/// Pre-calculate signature for faster order execution
+async fn prepare_signature_cache(client: &Arc<Client>) {
+    println!("🔐 Checking authentication and pre-warming API connections...");
+
+    // Check balance to ensure credentials are valid and warm up connections
+    if let Some(balance) = check_balance(client, TARGET_TOKEN).await {
+        println!("✅ Authentication successful. Available balance: {}", balance);
+
+        // Pre-populate the balance cache
+        let mut cache = BALANCE_CACHE.lock().await;
+        *cache = Some(BalanceCache {
+            timestamp: Instant::now(),
+            balance,
+        });
+    } else {
+        println!("⚠️ Could not validate authentication. Please check your API credentials.");
+    }
 }
 
 /// Main async function
 #[tokio::main]
 async fn main() {
-    println!("⚡ Starting Bitget Microsecond HFT Bot at {:?}", SystemTime::now());
+    println!("🚀 Starting Bitget HFT Bot at {:?}", SystemTime::now());
     println!("🎯 Targeting token: {}", TARGET_TOKEN);
-    
-    // Apply system optimizations for lowest latency
-    optimize_thread_priority();
-    
-    // Create optimized HTTP client with aggressive timeouts
+
+    // Create optimized HTTP client with connection pooling and DNS caching
     let client = Arc::new(
         ClientBuilder::new()
-            .tcp_keepalive(Some(StdDuration::from_secs(60)))
-            .pool_max_idle_per_host(20)
-            .tcp_nodelay(true) // Disable Nagle's algorithm for lowest latency
-            .min_tls_version(reqwest::tls::Version::TLS_1_2) // Faster handshakes
-            .http2_keep_alive_interval(Some(StdDuration::from_secs(5)))
-            .http2_keep_alive_timeout(Some(StdDuration::from_secs(20)))
+            .tcp_keepalive(Some(Duration::from_secs(60)))
+            .timeout(Duration::from_secs(10))
+            .pool_max_idle_per_host(10)
             .build()
             .expect("Failed to build HTTP client"),
     );
-    
-    // Pre-warm system for microsecond execution
-    pre_warm_system(&client).await;
-    
-    // Launch WebSocket direct execution path
-    let ws_client = client.clone();
+
+    // Warm up connections before starting
+    warm_up_connections(&client).await;
+
+    // Pre-authenticate and validate credentials
+    prepare_signature_cache(&client).await;
+
+    // Channel for communicating token detection with sufficient buffer
+    let (tx, mut rx) = mpsc::channel::<String>(32);
+
+    // High priority channel for websocket detections
+    let (priority_tx, mut priority_rx) = mpsc::channel::<String>(8);
+
+    // Spawn WebSocket listener
+    let ws_tx = priority_tx.clone();
     tokio::spawn(async move {
-        listen_websocket_zero_delay(ws_client).await;
+        listen_websocket(ws_tx).await;
     });
-    
-    // Launch high-frequency polling backup path
-    let poll_client = client.clone();
+
+    // Spawn polling fallback
+    let client_poll = client.clone();
+    let poll_tx = tx.clone();
     tokio::spawn(async move {
-        poll_token_status_high_freq(poll_client).await;
+        poll_token_status(client_poll, poll_tx).await;
     });
-    
-    // Keep main thread alive until order execution completes
-    loop {
-        if ORDER_EXECUTED.load(Ordering::Relaxed) {
-            println!("✅ Main thread: Order execution confirmed. Exiting...");
-            // Allow a moment for all logs to flush
-            sleep(Duration::from_millis(100)).await;
+
+    // Spawn priority order processor
+    let priority_client = client.clone();
+    tokio::spawn(async move {
+        while let Some(coin_symbol) = priority_rx.recv().await {
+            if execute_sell_order(&priority_client, &coin_symbol).await {
+                println!("🎉 Bot finished: Sell order executed successfully via priority channel!");
+                return;
+            }
+        }
+    });
+
+    // Main loop - process regular detection events
+    while let Some(coin_symbol) = rx.recv().await {
+        if ORDER_EXECUTED.load(Ordering::SeqCst) {
+            println!("✅ Order already executed, exiting main loop.");
             break;
         }
-        sleep(Duration::from_millis(10)).await;
+
+        if execute_sell_order(&client, &coin_symbol).await {
+            println!("🎉 Bot finished: Sell order executed successfully!");
+            break;
+        } else {
+            println!("🔄 Retrying sell order...");
+            sleep(Duration::from_millis(100)).await;
+        }
     }
-    
-    println!("🏁 HFT Bot execution complete - Microsecond execution achieved");
+
+    println!("🏁 Bot execution complete");
 }
