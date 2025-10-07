@@ -11,22 +11,33 @@ use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, Duration};
 use once_cell::sync::Lazy;
+use std::env;
 
 type HmacSha256 = Hmac<Sha256>;
 
-// API Credentials
-const API_KEY: &str = "bg_2b02e2a62b65685cee763cc916285ed3";
-const SECRET_KEY: &str = "c347ccb5f4d73d8928f3c3a54258707e3bf2013400c38003fd5192d61dbeccae";
-const PASSPHRASE: &str = "HFTSellNow";
-const TARGET_TOKEN: &str = "PAWSUSDT";
-const COIN_AMOUNT: &str = "1020200"; // Adjust based on balance
+// API Credentials - Loaded from environment variables
+static API_KEY: Lazy<String> = Lazy::new(|| {
+    env::var("BITGET_API_KEY").expect("BITGET_API_KEY must be set in .env file")
+});
+static SECRET_KEY: Lazy<String> = Lazy::new(|| {
+    env::var("BITGET_SECRET_KEY").expect("BITGET_SECRET_KEY must be set in .env file")
+});
+static PASSPHRASE: Lazy<String> = Lazy::new(|| {
+    env::var("BITGET_PASSPHRASE").expect("BITGET_PASSPHRASE must be set in .env file")
+});
+static TARGET_TOKEN: Lazy<String> = Lazy::new(|| {
+    env::var("TARGET_TOKEN").expect("TARGET_TOKEN must be set in .env file")
+});
+static COIN_AMOUNT: Lazy<String> = Lazy::new(|| {
+    env::var("COIN_AMOUNT").expect("COIN_AMOUNT must be set in .env file")
+});
 
 // Endpoint constants
 const API_BASE_URL: &str = "https://api.bitget.com";
 const WS_URL: &str = "wss://ws.bitget.com/spot/v1/stream";
 
 // Pre-compute formatted symbol
-static FORMATTED_SYMBOL: Lazy<String> = Lazy::new(|| format!("{}_SPBL", TARGET_TOKEN));
+static FORMATTED_SYMBOL: Lazy<String> = Lazy::new(|| format!("{}_SPBL", *TARGET_TOKEN));
 
 // Improved atomic flags for better state management
 static ORDER_EXECUTED: AtomicBool = AtomicBool::new(false);
@@ -50,7 +61,7 @@ static ORDER_BODY: Lazy<String> = Lazy::new(|| {
         "symbol": *FORMATTED_SYMBOL,
         "side": "sell",
         "orderType": "market",
-        "quantity": COIN_AMOUNT,
+        "quantity": *COIN_AMOUNT,
         "force": "gtc"
     }).to_string()
 });
@@ -97,10 +108,10 @@ async fn check_balance(client: &Arc<Client>, coin_symbol: &str) -> Option<f64> {
     let response = client
         .get(format!("{}{}", API_BASE_URL, BALANCE_PATH))
         .header("Content-Type", "application/json")
-        .header("ACCESS-KEY", API_KEY)
+        .header("ACCESS-KEY", API_KEY.as_str())
         .header("ACCESS-SIGN", &signature)
         .header("ACCESS-TIMESTAMP", &timestamp)
-        .header("ACCESS-PASSPHRASE", PASSPHRASE)
+        .header("ACCESS-PASSPHRASE", PASSPHRASE.as_str())
         .timeout(Duration::from_secs(3))
         .send()
         .await;
@@ -186,10 +197,10 @@ async fn execute_sell_order(client: &Arc<Client>, coin_symbol: &str) -> bool {
     let response = client
         .post(format!("{}{}", API_BASE_URL, ORDER_PATH))
         .header("Content-Type", "application/json")
-        .header("ACCESS-KEY", API_KEY)
+        .header("ACCESS-KEY", API_KEY.as_str())
         .header("ACCESS-SIGN", &*ORDER_SIGNATURE) // Dereference Lazy<String> to get &str
         .header("ACCESS-TIMESTAMP", &timestamp)
-        .header("ACCESS-PASSPHRASE", PASSPHRASE)
+        .header("ACCESS-PASSPHRASE", PASSPHRASE.as_str())
         .body(ORDER_BODY.clone())
         .timeout(Duration::from_millis(800))
         .send()
@@ -253,9 +264,9 @@ async fn poll_token_status(client: Arc<Client>, tx: mpsc::Sender<String>) {
                         .as_array()
                         .unwrap_or(&vec![])
                         .iter()
-                        .any(|item| item["symbolName"] == TARGET_TOKEN && item["status"] == "online")
+                        .any(|item| item["symbolName"] == *TARGET_TOKEN && item["status"] == "online")
                     {
-                        println!("🚨 Token {} detected via polling!", TARGET_TOKEN);
+                        println!("🚨 Token {} detected via polling!", *TARGET_TOKEN);
                         let _ = tx.try_send(TARGET_TOKEN.to_string());
                     }
                 }
@@ -295,7 +306,7 @@ async fn listen_websocket(tx: mpsc::Sender<String>) {
                     "args": [{
                         "instType": "sp",
                         "channel": "ticker",
-                        "instId": TARGET_TOKEN
+                        "instId": *TARGET_TOKEN
                     }]
                 });
 
@@ -344,7 +355,7 @@ async fn listen_websocket(tx: mpsc::Sender<String>) {
                                         .and_then(|a| a.get("instId"))
                                         .and_then(Value::as_str)
                                     {
-                                        if inst_id == TARGET_TOKEN {
+                                        if inst_id == *TARGET_TOKEN {
                                             println!(
                                                 "🚨 TARGET TOKEN DETECTED via WebSocket: {}",
                                                 inst_id
@@ -406,7 +417,7 @@ async fn prepare_signature_cache(client: &Arc<Client>) {
     println!("🔐 Checking authentication and pre-warming API connections...");
 
     // Check balance to ensure credentials are valid and warm up connections
-    if let Some(balance) = check_balance(client, TARGET_TOKEN).await {
+    if let Some(balance) = check_balance(client, &TARGET_TOKEN).await {
         println!("✅ Authentication successful. Available balance: {}", balance);
 
         // Pre-populate the balance cache
@@ -423,8 +434,11 @@ async fn prepare_signature_cache(client: &Arc<Client>) {
 /// Main async function
 #[tokio::main]
 async fn main() {
+    // Load environment variables from .env file
+    dotenv::dotenv().ok();
+    
     println!("🚀 Starting Bitget HFT Bot at {:?}", SystemTime::now());
-    println!("🎯 Targeting token: {}", TARGET_TOKEN);
+    println!("🎯 Targeting token: {}", *TARGET_TOKEN);
 
     // Create optimized HTTP client with connection pooling and DNS caching
     let client = Arc::new(
